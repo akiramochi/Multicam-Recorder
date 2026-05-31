@@ -118,7 +118,7 @@ class StreamWorker(QThread):
             on_status=self.status_changed.emit,
             on_error=self._on_enc_error,
             on_stopped=self._on_enc_stopped,
-            log_tag="NDI",
+            log_tag=f"NDI:{self.source_name}",
         )
         encoder.start()
 
