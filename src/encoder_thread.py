@@ -32,8 +32,10 @@ The worker supplies four callables so this class stays codec/source agnostic:
 plus on_status / on_error / on_stopped callbacks (which emit the worker's Qt
 signals) and a log_tag for diagnostic prints.
 """
+import os
 import queue
 import threading
+import time
 
 
 class EncoderThread(threading.Thread):
@@ -58,9 +60,15 @@ class EncoderThread(threading.Thread):
         self._tag             = log_tag
 
         self._q: queue.Queue = queue.Queue(maxsize=maxsize)
+        self._maxsize = maxsize
         self._dropped = 0          # video frames discarded since last log
         self._dropped_total = 0
+        self._submitted = 0        # total video frames handed in (for stats)
         self._audio_drop_warned = False
+        # Opt-in per-stream timing diagnostics: set env MCR_ENC_STATS=1 to get a
+        # breakdown of where each frame's time goes (conversion vs encode vs mux)
+        # plus in/out frame rates, so a throughput deficit can be pinpointed.
+        self._stats = bool(os.environ.get("MCR_ENC_STATS"))
 
     # ------------------------------------------------------------------
     # Producer API — called from the capture thread
@@ -94,6 +102,7 @@ class EncoderThread(threading.Thread):
 
     def submit_video(self, payload, frame_ts):
         """Hand a raw video payload to the encoder.  Droppable when backed up."""
+        self._submitted += 1
         try:
             self._q.put_nowait(("video", payload, frame_ts))
         except queue.Full:
@@ -158,9 +167,39 @@ class EncoderThread(threading.Thread):
             session_failed = False
             v_err_count  = 0
 
+        # Per-interval timing accumulators (only used when self._stats).
+        st_t0 = time.monotonic()
+        st_n = 0                      # frames encoded since last report
+        st_build = st_enc = st_mux = 0.0
+        st_last_sub = st_last_drop = 0
+
         while True:
             item = self._q.get()
             kind = item[0]
+
+            if self._stats:
+                _now = time.monotonic()
+                if _now - st_t0 >= 3.0:
+                    dt = _now - st_t0
+                    sub = self._submitted
+                    drop = self._dropped_total
+                    nb = max(1, st_n)
+                    # in/out: frames submitted vs encoded per second.  build/enc/
+                    # mux: avg wall-clock ms per frame in each stage (wall-clock,
+                    # so time blocked on the GIL by sibling streams shows up too).
+                    print(f"[{self._tag}] stats {dt:.1f}s: "
+                          f"in={(sub - st_last_sub) / dt:5.1f}/s "
+                          f"out={st_n / dt:5.1f}/s "
+                          f"drop+={drop - st_last_drop} "
+                          f"q={self._q.qsize()}/{self._maxsize} "
+                          f"build={1000 * st_build / nb:5.1f}ms "
+                          f"enc={1000 * st_enc / nb:5.1f}ms "
+                          f"mux={1000 * st_mux / nb:5.1f}ms", flush=True)
+                    st_t0 = _now
+                    st_n = 0
+                    st_build = st_enc = st_mux = 0.0
+                    st_last_sub = sub
+                    st_last_drop = drop
 
             if kind == "quit":
                 break
@@ -217,6 +256,7 @@ class EncoderThread(threading.Thread):
                             continue
 
                     try:
+                        _ta = time.perf_counter() if self._stats else 0.0
                         vf = self._build_video(payload)
                         if vf is None:
                             continue
@@ -233,7 +273,14 @@ class EncoderThread(threading.Thread):
                         v_last_pts = new_pts
                         vf.pts = new_pts
 
-                        for pkt in v_stream.encode(vf):
+                        if self._stats:
+                            _tb = time.perf_counter()
+                            st_build += _tb - _ta
+                        pkts = list(v_stream.encode(vf))
+                        if self._stats:
+                            _tc = time.perf_counter()
+                            st_enc += _tc - _tb
+                        for pkt in pkts:
                             # NVENC's pipeline delay makes the first packet's DTS
                             # negative; compute a one-time shift to bring it to 0
                             # and apply it to every packet so DTS stays ≥ 0.
@@ -250,6 +297,8 @@ class EncoderThread(threading.Thread):
                                 if pkt.pts is not None:
                                     pkt.pts += v_dts_offset
                             container.mux(pkt)
+                        if self._stats:
+                            st_mux += time.perf_counter() - _tc
 
                         # The first video mux triggers write_header with the
                         # correct video codecpar/extradata; now flush any audio
@@ -273,6 +322,7 @@ class EncoderThread(threading.Thread):
                                               else float(round(fps)))
                             except Exception:
                                 v_pts_mult = float(round(fps))
+                        st_n += 1
                     except Exception as exc:
                         if v_err_count < 3:
                             print(f"[{self._tag}] video encode error: {exc}",
