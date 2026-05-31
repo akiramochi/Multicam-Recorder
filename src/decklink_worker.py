@@ -5,7 +5,6 @@ Exposes the same signals as StreamWorker so StreamTile works unchanged.
 import ctypes
 import queue
 import time
-from datetime import datetime
 from fractions import Fraction
 
 import numpy as np
@@ -13,6 +12,7 @@ from PyQt6.QtCore import QThread, QMutex, pyqtSignal
 from PyQt6.QtGui import QImage
 
 from .recording_settings import RecordingSettings
+from .encoder_thread import EncoderThread
 from .decklink_manager import (
     IDeckLinkInput, IDeckLinkIterator,
     BMD_MODE_DETECT, BMD_FORMAT_8BIT_YUV,
@@ -117,30 +117,30 @@ except ImportError:
 _PREVIEW_MAX_W = 320
 _PREVIEW_MAX_H = 180
 
+# Frame rate (frames/sec) for each detected display mode.  Used to set the
+# recording's time base so the container matches the source: a 50/59.94/60p
+# signal recorded with a 1/30 time base loses half its frames to the PTS
+# monotonic clamp, and a 25p signal is slightly mistimed.  Interlaced modes
+# deliver one full frame per field-pair, so 1080i59.94 → 29.97 frames/sec.
+_DEFAULT_FPS = 30000 / 1001   # 29.97 — used when the mode is unknown
+_MODE_FPS = {
+    BMD_MODE_HD1080I5994: 30000 / 1001,   # 29.97
+    BMD_MODE_HD1080I50:   25.0,
+    BMD_MODE_HD1080P2997: 30000 / 1001,   # 29.97
+    BMD_MODE_HD1080P30:   30.0,
+    BMD_MODE_HD1080P25:   25.0,
+    BMD_MODE_HD1080P24:   24.0,
+    BMD_MODE_HD720P5994:  60000 / 1001,   # 59.94
+    BMD_MODE_HD720P60:    60.0,
+    BMD_MODE_HD720P50:    50.0,
+    BMD_MODE_NTSC:        30000 / 1001,   # 29.97
+    BMD_MODE_PAL:         25.0,
+}
+
 
 # ---------------------------------------------------------------------------
 # UYVY ↔ YUV/RGB helpers (numpy-only — PyAV from_ndarray rejects uyvy422)
 # ---------------------------------------------------------------------------
-
-def _uyvy_to_rgb(uyvy: np.ndarray, w: int, h: int) -> np.ndarray:
-    """
-    Convert a UYVY (8-bit YUV 4:2:2 packed) array of shape (h, w*2) to
-    an RGB24 array of shape (h, w, 3).  No PyAV required; pure numpy.
-
-    UYVY byte layout per 4-byte macro-pixel: [U, Y0, V, Y1]
-    BT.601 full-range YCbCr → RGB coefficients.
-    """
-    macro = uyvy.reshape(h, w // 2, 4).astype(np.float32)
-    Y = np.empty((h, w), dtype=np.float32)
-    Y[:, 0::2] = macro[:, :, 1]          # Y0
-    Y[:, 1::2] = macro[:, :, 3]          # Y1
-    U = np.repeat(macro[:, :, 0], 2, axis=1) - 128.0   # (h, w)
-    V = np.repeat(macro[:, :, 2], 2, axis=1) - 128.0   # (h, w)
-    R = np.clip(Y + 1.40200 * V,                   0.0, 255.0)
-    G = np.clip(Y - 0.34414 * U - 0.71414 * V,    0.0, 255.0)
-    B = np.clip(Y + 1.77200 * U,                   0.0, 255.0)
-    return np.stack([R, G, B], axis=2).astype(np.uint8)
-
 
 def _uyvy_to_yuv420p(uyvy: np.ndarray, w: int, h: int):
     """
@@ -158,47 +158,6 @@ def _uyvy_to_yuv420p(uyvy: np.ndarray, w: int, h: int):
     U_420 = ((U[0::2] + U[1::2]) >> 1).astype(np.uint8)   # (h//2, w//2)
     V_420 = ((V[0::2] + V[1::2]) >> 1).astype(np.uint8)   # (h//2, w//2)
     return Y, U_420, V_420
-
-
-# ---------------------------------------------------------------------------
-# Display-mode inference from geometry + frame rate
-# ---------------------------------------------------------------------------
-
-def _infer_display_mode(w: int, h: int, is_prog: bool,
-                         dur: int, scale: int) -> int:
-    """
-    Return a BMDDisplayMode FourCC inferred from frame geometry and rate.
-    dur/scale come from IDeckLinkDisplayMode::GetFrameRate().
-    fps_k = fps × 1000 (integer, avoids float rounding).
-    Returns 0 if the combination is not recognised.
-    """
-    if dur <= 0 or scale <= 0:
-        return 0
-    fps_k = (scale * 1000) // dur
-
-    if w == 1920 and h == 1080:
-        if is_prog:
-            if 23960 <= fps_k < 23990:  return 0x32337073  # '23ps' 1080p23.98
-            if fps_k == 24000:          return 0x32347073  # '24ps' 1080p24
-            if fps_k == 25000:          return 0x48703235  # 'Hp25' 1080p25
-            if 29950 <= fps_k < 29990:  return 0x48703239  # 'Hp29' 1080p29.97
-            if fps_k == 30000:          return 0x48703330  # 'Hp30' 1080p30
-            if fps_k == 50000:          return 0x48703530  # 'Hp50' 1080p50
-            if 59900 <= fps_k < 59980:  return 0x48703539  # 'Hp59' 1080p59.94
-            if fps_k == 60000:          return 0x48703630  # 'Hp60' 1080p60
-        else:
-            if 29950 <= fps_k < 29990:  return 0x48693539  # 'Hi59' 1080i59.94
-            if fps_k == 25000:          return 0x48693530  # 'Hi50' 1080i50
-            if fps_k == 30000:          return 0x48693630  # 'Hi60' 1080i60
-    elif w == 1280 and h == 720:
-        if fps_k == 50000:              return 0x68703530  # 'hp50' 720p50
-        if 59900 <= fps_k < 59980:      return 0x68703539  # 'hp59' 720p59.94
-        if fps_k == 60000:              return 0x68703630  # 'hp60' 720p60
-    elif w == 720 and 480 <= h <= 490:
-        return 0x6E747363  # 'ntsc'
-    elif w == 720 and h == 576:
-        return 0x70616C20  # 'pal '
-    return 0
 
 
 # ---------------------------------------------------------------------------
@@ -419,8 +378,13 @@ class DeckLinkWorker(QThread):
         self._start_flag = False
         self._stop_flag  = False
         self._pending_path = ''
+        # Authoritative recording-session state (guarded by _mutex).  Set by the
+        # capture loop on start/stop and cleared by the encoder thread (via
+        # _on_enc_stopped) when a session ends or aborts.
+        self._rec_active = False
         self._preview_interval = 1.0 / self._PREVIEW_FPS
         self._last_preview_ts  = 0.0
+        self._swscale_failed   = False   # one-time warn if the fast path fails
 
     # ------------------------------------------------------------------
     # Public API (GUI thread)
@@ -463,6 +427,10 @@ class DeckLinkWorker(QThread):
         if not _COMTYPES_OK or not _AV_OK:
             self._err('comtypes or av not available')
             return
+
+        # Detected source frame rate; refined from the enabled/locked display
+        # mode (see _MODE_FPS) and used for the recording time base + UI.
+        cur_fps = _DEFAULT_FPS
 
         try:
             comtypes.CoInitializeEx(comtypes.COINIT_MULTITHREADED)
@@ -572,6 +540,10 @@ class DeckLinkWorker(QThread):
                 print(f'[DeckLink] EnableVideoInput({_label}): '
                       f'0x{hr & 0xFFFFFFFF:08X}', flush=True)
                 if hr == 0:
+                    # Best-effort rate from the enabled mode.  For pass 1/2 the
+                    # real mode is reported later via VideoInputFormatChanged
+                    # (which refines cur_fps); for pass 3 this is authoritative.
+                    cur_fps = _MODE_FPS.get(_mode, cur_fps)
                     break
             if hr != 0:
                 raise RuntimeError('EnableVideoInput: all modes failed')
@@ -592,27 +564,25 @@ class DeckLinkWorker(QThread):
         self._running = True
         self.status_changed.emit('Connected')
 
-        container    = None
-        v_stream     = None
-        a_stream     = None
-        is_recording = False
-        # v_rec_start  : monotonic timestamp of the first recorded video frame.
-        # v_pts_mult   : 1 / codec_context.time_base  (set after the codec
-        #                opens on the first encode call).  Deriving it from the
-        #                codec — not the container stream — handles B-frame
-        #                time-base doubling (HIGH profile libx264 uses 1/60
-        #                instead of 1/30, causing 2× fast-forward if ignored).
-        v_rec_start: float = 0.0
-        v_pts_mult:  float = 0.0   # populated after first encode
-        v_last_pts:  int   = -1    # last input PTS used; enforces strict monotonicity
-        a_pts:       int   = 0     # monotonic audio sample counter (reset each recording)
-        v_dts_offset: int  = -1    # shift so first video DTS = 0; -1 = not yet seen
-        audio_pkt_buf      = []    # encoded audio pkts held until first video pkt muxed
+        # Encode + mux runs on its own thread so a keyframe or disk flush can
+        # never stall this capture loop and force dropped frames (the periodic
+        # stutter).  This loop only converts/queues frames for the encoder.
+        encoder = EncoderThread(
+            open_container=self._open_container,
+            close_container=self._close_container,
+            build_video=self._build_video,
+            build_audio=self._build_audio,
+            use_nvenc=self._settings.use_nvenc,
+            on_status=self.status_changed.emit,
+            on_error=self._on_enc_error,
+            on_stopped=self._on_enc_stopped,
+            log_tag='DeckLink',
+        )
+        encoder.start()
+
         first_frame  = True
         output_path  = ''
-        # Diagnostic counters (limit log spam to first few events per recording).
-        v_dbg_pkt_count   = 0      # video packets logged so far
-        v_err_count       = 0      # video encode errors logged so far
+        enc_started  = False   # has begin() been sent for the current session?
 
         while self._running:
             # flags from GUI thread
@@ -620,26 +590,25 @@ class DeckLinkWorker(QThread):
             s_req = self._start_flag;  self._start_flag = False
             x_req = self._stop_flag;   self._stop_flag  = False
             ppath = self._pending_path
+            prev_active = self._rec_active
+            if s_req:
+                self._rec_active = True
+            if x_req:
+                self._rec_active = False
+            rec_active = self._rec_active
             self._mutex.unlock()
 
-            if s_req and not is_recording:
+            if s_req and not prev_active:
                 output_path  = ppath
-                is_recording = True
+                enc_started  = False
                 self.status_changed.emit('Waiting for frame…')
                 self.recording_started.emit(output_path)
 
-            if x_req and is_recording:
-                container, v_stream, a_stream = self._close_container(
-                    container, v_stream, a_stream)
-                is_recording = False
-                v_rec_start  = 0.0
-                v_pts_mult   = 0.0
-                v_last_pts   = -1
-                a_pts        = 0
-                v_dts_offset = -1
-                audio_pkt_buf = []
-                self.status_changed.emit('Connected')
-                self.recording_stopped.emit()
+            if x_req and prev_active:
+                # Hand the close to the encoder thread; it drains queued frames,
+                # writes the trailer, then emits recording_stopped.
+                encoder.end()
+                enc_started = False
 
             # drain the frame queue
             try:
@@ -656,219 +625,31 @@ class DeckLinkWorker(QThread):
                     # First frame after a restart: allow VideoInputFormatChanged
                     # to fire again so genuine signal changes are handled.
                     callback._format_change_sent = False
-                    self.stream_info.emit(w, h, 29.97)  # fps updated on format change
+                    self.stream_info.emit(w, h, cur_fps)
 
                 now = time.monotonic()
                 if now - self._last_preview_ts >= self._preview_interval:
                     self._last_preview_ts = now
                     self._emit_preview(uyvy, w, h)
 
-                if is_recording:
-                    if container is None:
-                        try:
-                            container, v_stream, a_stream = self._open_container(
-                                output_path, w, h, 29.97)
-                            v_rec_start = frame_ts   # anchor for PTS calculation
-                            # For NVENC, _open_container pre-opens the codec,
-                            # so codec_context.time_base is valid NOW.  Discover
-                            # v_pts_mult here, BEFORE the first encode, so every
-                            # frame (including frame 1) gets a unique PTS.
-                            # Without this, NVENC's 1-frame pipeline delay means
-                            # frames 1 AND 2 both go in with vf.pts=0 (the
-                            # "anchor" branch below), NVENC emits two output
-                            # packets with PTS=0, and the MOV muxer rejects the
-                            # duplicate with EINVAL on the second video mux.
-                            if v_pts_mult == 0.0:
-                                try:
-                                    ctb = v_stream.codec_context.time_base
-                                    if ctb and float(ctb) > 0.0:
-                                        v_pts_mult = 1.0 / float(ctb)
-                                        print(f'[DeckLink] post-open '
-                                              f'codec_context.time_base={ctb} '
-                                              f'v_pts_mult={v_pts_mult:.1f}',
-                                              flush=True)
-                                except Exception:
-                                    pass
-                            self.status_changed.emit('Recording')
-                        except Exception as exc:
-                            self._err(f'Cannot open output: {exc}')
-                            is_recording = False
-                            self.status_changed.emit('Connected')
-                            self.recording_stopped.emit()
-
-                    if container and v_stream:
-                        try:
-                            Y, U, V = _uyvy_to_yuv420p(uyvy, w, h)
-                            vf = av.VideoFrame(w, h, 'yuv420p')
-                            vf.planes[0].update(Y.tobytes())
-                            vf.planes[1].update(U.tobytes())
-                            vf.planes[2].update(V.tobytes())
-                            # PTS must be in codec_context.time_base units.
-                            # libx264 HIGH profile doubles its internal time_base
-                            # (1/30 → 1/60) to express B-frame display order; using
-                            # the container stream time_base instead would give PTS
-                            # values 2× too small, causing 2× fast-forward playback.
-                            # v_pts_mult = 1 / codec_context.time_base is read after
-                            # the first encode (when the codec is fully open).
-                            if v_pts_mult > 0.0:
-                                # Compute PTS from the wall-clock timestamp, but
-                                # enforce strict monotonicity.  At 29.97 fps with
-                                # a 1/30 codec time-base, two consecutive frames
-                                # whose wall-clock timestamps are within ~16 ms of
-                                # each other (driver jitter, startup bursts) round
-                                # to the same integer tick.  libx264 silently
-                                # coalesces such inputs; NVENC emits one packet per
-                                # input frame and the duplicate DTS makes the MOV
-                                # muxer return EINVAL.  Clamping new_pts to
-                                # last_pts + 1 keeps every PTS unique and the
-                                # cumulative drift bounded by total frame count.
-                                new_pts = max(0, round(
-                                    (frame_ts - v_rec_start) * v_pts_mult))
-                                if new_pts <= v_last_pts:
-                                    new_pts = v_last_pts + 1
-                                v_last_pts = new_pts
-                                vf.pts = new_pts
-                            else:
-                                vf.pts = 0  # first frame — anchor point
-                                v_last_pts = 0
-                            pkt_list = list(v_stream.encode(vf))
-                            if v_dbg_pkt_count < 5 and self._settings.use_nvenc:
-                                if pkt_list:
-                                    _p0 = pkt_list[0]
-                                    print(f'[DeckLink] DBG encode→{len(pkt_list)}pkt '
-                                          f'in.pts={vf.pts} '
-                                          f'out.dts={_p0.dts} out.pts={_p0.pts}',
-                                          flush=True)
-                                else:
-                                    print(f'[DeckLink] DBG encode→0pkt '
-                                          f'in.pts={vf.pts} (pipeline buffer)',
-                                          flush=True)
-                            for pkt in pkt_list:
-                                # NVENC has an internal pipeline delay that
-                                # makes the first output packet's DTS negative
-                                # (DTS = PTS − delay).  On the very first
-                                # packet we compute a fixed shift to bring
-                                # DTS to 0; the same shift is applied to every
-                                # subsequent packet so DTS stays monotonically
-                                # ≥ 0.  For no-B-frame software codecs the
-                                # first DTS is already 0 so v_dts_offset = 0
-                                # and nothing changes.
-                                if v_dts_offset < 0:   # first packet ever seen
-                                    raw_dts = pkt.dts if pkt.dts is not None else 0
-                                    v_dts_offset = max(0, -raw_dts)
-                                    if v_dts_offset:
-                                        print(f'[DeckLink] DTS offset = {v_dts_offset}'
-                                              f' (NVENC pipeline delay)', flush=True)
-                                if v_dts_offset > 0:
-                                    if pkt.dts is not None:
-                                        pkt.dts += v_dts_offset
-                                    if pkt.pts is not None:
-                                        pkt.pts += v_dts_offset
-                                # Diagnostic: log pkt timing & mux result for
-                                # the first few packets, so we can see whether
-                                # write_header succeeded and what DTS/PTS values
-                                # the muxer is being given.
-                                _dbg = v_dbg_pkt_count < 5
-                                if _dbg:
-                                    print(f'[DeckLink] DBG pre-mux #{v_dbg_pkt_count} '
-                                          f'dts={pkt.dts} pts={pkt.pts} '
-                                          f'size={pkt.size} key={pkt.is_keyframe}',
-                                          flush=True)
-                                try:
-                                    container.mux(pkt)
-                                    if _dbg:
-                                        print(f'[DeckLink] DBG muxed #{v_dbg_pkt_count} OK',
-                                              flush=True)
-                                    v_dbg_pkt_count += 1
-                                except Exception as _me:
-                                    if v_err_count < 3:
-                                        print(f'[DeckLink] DBG mux FAIL #{v_dbg_pkt_count} '
-                                              f'dts={pkt.dts} pts={pkt.pts}: {_me}',
-                                              flush=True)
-                                    v_err_count += 1
-                                    raise
-                            # Once the first video packet has been muxed it
-                            # triggered avformat_write_header, so NVENC's SPS/PPS
-                            # extradata is now committed to the container header.
-                            # Flush any audio packets that were buffered while we
-                            # waited — if they had triggered write_header first the
-                            # video codecpar (extradata) might not have been synced
-                            # yet, producing a broken video track and EINVAL on
-                            # every subsequent video mux.
-                            if audio_pkt_buf and v_dts_offset >= 0:
-                                for _ap in audio_pkt_buf:
-                                    try:
-                                        container.mux(_ap)
-                                    except Exception as _ae:
-                                        print(f'[DeckLink] buffered audio mux'
-                                              f' error: {_ae}', flush=True)
-                                audio_pkt_buf.clear()
-                            # Codec opens on first encode; read its actual time_base
-                            # now so all subsequent PTS values use the right scale.
-                            if v_pts_mult == 0.0:
-                                try:
-                                    ctb = v_stream.codec_context.time_base
-                                    if ctb and float(ctb) > 0.0:
-                                        v_pts_mult = 1.0 / float(ctb)
-                                    else:
-                                        raise ValueError(f'invalid codec tb: {ctb}')
-                                    print(f'[DeckLink] codec_context.time_base={ctb} '
-                                          f'v_pts_mult={v_pts_mult:.1f}', flush=True)
-                                except Exception as _te:
-                                    # Fallback: use whatever stream time_base reports
-                                    try:
-                                        stb = v_stream.time_base
-                                        if stb and float(stb) > 0.0:
-                                            v_pts_mult = 1.0 / float(stb)
-                                    except Exception:
-                                        v_pts_mult = 30.0  # last-resort: 30 fps
-                                    print(f'[DeckLink] codec_context.time_base '
-                                          f'unavailable ({_te}); '
-                                          f'v_pts_mult={v_pts_mult:.1f}', flush=True)
-                        except Exception as exc:
-                            if v_err_count < 3:
-                                print(f'[DeckLink] video encode error: {exc}', flush=True)
-                            v_err_count += 1
+                if rec_active:
+                    if not enc_started:
+                        # cur_fps is the detected source rate (see _MODE_FPS); it
+                        # sets the container time base.  The encoder still derives
+                        # real PTS from wall-clock arrival time, so sub-frame rate
+                        # jitter doesn't drift.
+                        enc_started = encoder.begin(output_path, w, h, cur_fps)
+                    if enc_started:
+                        # uyvy was copied in the driver callback, so handing the
+                        # reference to the encoder thread is safe.
+                        encoder.submit_video((uyvy, w, h), frame_ts)
 
             elif kind == 'audio':
                 _, pcm, n_samp, audio_ts = item
-                if is_recording and container and a_stream:
-                    try:
-                        # pcm is int32, shape (2, n_samp); convert to float32 planar
-                        flt = pcm.astype(np.float32) / 2**31
-                        af  = av.AudioFrame(format='fltp', layout='stereo', samples=n_samp)
-                        af.sample_rate = BMD_AUDIO_SAMPLE_RATE_48K
-                        # Use a monotonic sample counter for audio PTS.
-                        # The previous timestamp-based approach
-                        # (audio_ts − v_rec_start, clamped to ≥0) produced
-                        # duplicate PTS values when several audio frames in
-                        # the queue had timestamps before v_rec_start — they
-                        # all mapped to PTS=0.  The AAC encoder passed them
-                        # through but the resulting output packets had
-                        # identical DTS, which the MOV/MP4 muxer rejected
-                        # with EINVAL (errno 22), corrupting the interleave
-                        # queue and causing all subsequent mux calls to fail.
-                        #
-                        # The +1024 shift compensates for AAC-LC's built-in
-                        # 1024-sample encoder delay so the first output packet
-                        # has DTS=0 (not −1024).  The encoder writes
-                        # initial_padding=1024; the muxer records an edit list
-                        # (elst) at write_trailer for correct player AV sync.
-                        _AAC_DELAY = 1024
-                        af.pts  = a_pts + _AAC_DELAY
-                        a_pts  += n_samp
-                        af.planes[0].update(flt[0].tobytes())
-                        af.planes[1].update(flt[1].tobytes())
-                        for pkt in a_stream.encode(af):
-                            # Hold audio packets until the first video packet
-                            # has been muxed (and write_header triggered with
-                            # correct video codecpar).  After that, mux directly.
-                            if v_dts_offset >= 0:
-                                container.mux(pkt)
-                            else:
-                                audio_pkt_buf.append(pkt)
-                    except Exception as exc:
-                        print(f'[DeckLink] audio encode error: {exc}', flush=True)
+                if rec_active and enc_started:
+                    # pcm was copied in the driver callback; the encoder thread
+                    # converts to float and builds the AudioFrame.
+                    encoder.submit_audio((pcm, n_samp))
 
             elif kind == 'format_change':
                 # VideoInputFormatChanged fired — restart with the correct mode.
@@ -877,18 +658,19 @@ class DeckLinkWorker(QThread):
                 # Do NOT call DisableVideoInput here — that unregisters the
                 # callback set by SetCallback, so no frames arrive after restart.
                 new_mode = item[1]
+                # Refine the detected source rate from the locked mode; the next
+                # first_frame emits it to the UI and the next begin() uses it.
+                cur_fps = _MODE_FPS.get(new_mode, cur_fps)
                 # Close any active recording first (resolution/fps may change).
-                if is_recording:
-                    container, v_stream, a_stream = self._close_container(
-                        container, v_stream, a_stream)
-                    is_recording = False
-                    v_rec_start  = 0.0
-                    v_pts_mult   = 0.0
-                    v_last_pts   = -1
-                    a_pts        = 0
-                    v_dts_offset = -1
-                    audio_pkt_buf = []
-                    self.recording_stopped.emit()
+                # The encoder thread drains queued frames and emits
+                # recording_stopped via _on_enc_stopped.
+                if rec_active:
+                    encoder.end()
+                    enc_started = False
+                    self._mutex.lock()
+                    self._rec_active = False
+                    self._mutex.unlock()
+                    rec_active = False
                 try:
                     _dl_fn(_dl_ptr, _DL_SLOT['StopStreams'], _DL_VOID1_T)(_dl_ptr)
                     # Use FLAG_DEFAULT (no format detection) on restart to
@@ -928,8 +710,74 @@ class DeckLinkWorker(QThread):
         except Exception:
             pass
 
-        if container:
-            self._close_container(container, v_stream, a_stream)
+        # Let the encoder finish any queued frames and close the file.
+        encoder.shutdown()
+        encoder.join(timeout=10.0)
+
+    # ------------------------------------------------------------------
+
+    def _build_video(self, payload):
+        """Build a yuv420p av.VideoFrame from copied UYVY data (encoder thread).
+
+        Fast path: let libswscale do the UYVY 4:2:2 → YUV420p conversion in C.
+        It is SIMD-optimised and releases the GIL, so with several streams the
+        conversions run in parallel instead of serialising on the interpreter.
+        That is the throughput lever that matters here: with NVENC the GPU is
+        nowhere near saturated by 3–4×1080p, but doing the colour conversion in
+        numpy on Python threads was starving it.  '2vuy' (what the card delivers)
+        is packed UYVY 4:2:2, i.e. FFmpeg's 'uyvy422'.
+
+        Falls back to the proven numpy conversion if frame construction fails.
+        """
+        uyvy, w, h = payload
+        try:
+            src = av.VideoFrame(w, h, 'uyvy422')
+            plane = src.planes[0]
+            row = w * 2                             # bytes per UYVY row
+            # Pass the array buffer straight to plane.update (reshape(-1) is a
+            # free view of the contiguous copy made in the driver callback).
+            # Going via .tobytes() would add a ~4 MB GIL-held copy per frame —
+            # measured to roughly halve multi-stream throughput.
+            if plane.line_size == row:
+                plane.update(uyvy.reshape(-1))
+            else:
+                # Plane rows are padded to the codec's alignment — pad to match
+                # so rows don't shear.
+                buf = np.zeros((h, plane.line_size), dtype=np.uint8)
+                buf[:, :row] = uyvy
+                plane.update(buf.reshape(-1))
+            return src.reformat(format='yuv420p')
+        except Exception as exc:
+            if not self._swscale_failed:
+                print(f'[DeckLink] swscale UYVY→YUV420p failed ({exc}); '
+                      f'falling back to numpy conversion', flush=True)
+                self._swscale_failed = True
+            Y, U, V = _uyvy_to_yuv420p(uyvy, w, h)
+            vf = av.VideoFrame(w, h, 'yuv420p')
+            vf.planes[0].update(Y.tobytes())
+            vf.planes[1].update(U.tobytes())
+            vf.planes[2].update(V.tobytes())
+            return vf
+
+    def _build_audio(self, payload):
+        """Build a stereo fltp av.AudioFrame from copied int32 PCM."""
+        pcm, n_samp = payload
+        flt = pcm.astype(np.float32) / 2**31
+        af = av.AudioFrame(format='fltp', layout='stereo', samples=n_samp)
+        af.sample_rate = BMD_AUDIO_SAMPLE_RATE_48K
+        af.planes[0].update(flt[0].tobytes())
+        af.planes[1].update(flt[1].tobytes())
+        return af, n_samp
+
+    def _on_enc_error(self, msg: str):
+        self._err(msg)
+
+    def _on_enc_stopped(self):
+        self._mutex.lock()
+        self._rec_active = False
+        self._mutex.unlock()
+        self.status_changed.emit('Connected')
+        self.recording_stopped.emit()
 
     # ------------------------------------------------------------------
 
@@ -963,7 +811,11 @@ class DeckLinkWorker(QThread):
                   flush=True)
 
     def _open_container(self, path, w, h, fps):
-        c       = av.open(path, mode='w', options={'movflags': '+faststart'})
+        # NOTE: no movflags=+faststart — it rewrites the whole file at close to
+        # relocate the moov atom, making stop() take longer the larger the file.
+        # moov-at-end plays back fine locally; remux for faststart post-hoc if
+        # progressive streaming is ever required.
+        c       = av.open(path, mode='w')
         codec   = self._settings.effective_video_codec
         profile = self._settings.active_video_profile
         nvenc   = self._settings.use_nvenc

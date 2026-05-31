@@ -1,4 +1,4 @@
-"""
+r"""
 Named-profile persistence for RecordingSettings + open source list.
 
 Profiles are stored in a single JSON file:
