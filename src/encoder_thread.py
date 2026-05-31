@@ -47,8 +47,20 @@ class EncoderThread(threading.Thread):
     def __init__(self, *, open_container, close_container,
                  build_video, build_audio, use_nvenc,
                  on_status, on_error, on_stopped,
-                 log_tag="ENC", maxsize=30):
+                 log_tag="ENC", maxsize=60):
         super().__init__(daemon=True, name=f"{log_tag}-encoder")
+        # Queue depth = how long a system-wide hiccup (AV scan, disk flush, OS
+        # task) the buffer can ride out before dropping.  ~60 frames ≈ 2 s at
+        # 30 fps.  Each slot holds one raw frame (~4 MB UYVY / ~6 MB BGR), so the
+        # memory ceiling is maxsize × frame_size × streams, reached only while
+        # actually backed up (normally the queue sits near empty).  Override with
+        # env MCR_ENC_QUEUE if you need to trade RAM for more/less absorption.
+        _env_q = os.environ.get("MCR_ENC_QUEUE")
+        if _env_q:
+            try:
+                maxsize = max(4, int(_env_q))
+            except ValueError:
+                pass
         self._open_container  = open_container
         self._close_container = close_container
         self._build_video     = build_video
