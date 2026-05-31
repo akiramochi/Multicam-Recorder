@@ -4,17 +4,16 @@ from typing import Dict, List
 
 from PyQt6.QtCore import Qt, QTimer, pyqtSlot
 from PyQt6.QtWidgets import (
-    QComboBox, QFileDialog, QFrame, QHBoxLayout, QInputDialog, QLabel,
+    QComboBox, QFileDialog, QInputDialog, QLabel,
     QMainWindow, QPushButton, QScrollArea, QSizePolicy, QStatusBar,
     QToolBar, QVBoxLayout, QWidget, QMessageBox, QLineEdit,
 )
 
 from ..ndi_manager import NDIManager, NDISource
-from ..decklink_manager import DeckLinkManager, DeckLinkSource
-from ..decklink_worker import DeckLinkWorker
-from ..recording_settings import RecordingSettings
+from ..decklink_manager import DeckLinkManager
+from ..recording_settings import SourceOverrides
 from ..profile_manager import ProfileManager
-from ..osc_manager import OSCManager, OSC_AVAILABLE
+from ..osc_manager import OSCManager
 from .add_source_dialog import AddSourceDialog
 from .settings_dialog import SettingsDialog
 from .stream_tile import StreamTile
@@ -189,7 +188,6 @@ class MainWindow(QMainWindow):
         if len(available) == 1:
             self._add_tile(available[0])
             return
-        from PyQt6.QtWidgets import QInputDialog
         names = [s.name for s in available]
         name, ok = QInputDialog.getItem(self, 'Add DeckLink Source',
                                         'Select device:', names, 0, False)
@@ -198,12 +196,13 @@ class MainWindow(QMainWindow):
             if src:
                 self._add_tile(src)
 
-    def _add_tile(self, source: NDISource):
+    def _add_tile(self, source: NDISource, overrides: SourceOverrides | None = None):
         name = source.name
         if name in self._tiles:
             return
-        tile = StreamTile(source, self._settings, parent=self._grid_widget)
+        tile = StreamTile(source, self._settings, overrides=overrides, parent=self._grid_widget)
         tile.remove_requested.connect(self._remove_tile)
+        tile.overrides_changed.connect(self._on_overrides_changed)
         self._tiles[name] = tile
         self._grid_layout.addWidget(tile)
         self._empty_label.setVisible(False)
@@ -315,14 +314,25 @@ class MainWindow(QMainWindow):
                     (s for s in self._manager.get_sources() if s.name == src_name), None
                 )
             if src and src_name not in self._tiles:
-                self._add_tile(src)
+                ov = SourceOverrides.from_dict(entry.get("overrides", {}))
+                self._add_tile(src, overrides=ov)
 
     def _current_sources(self) -> list:
         """Serialisable snapshot of the tiles that are currently open."""
-        return [
-            {"type": tile.source_type, "name": tile.source_name}
-            for tile in self._tiles.values()
-        ]
+        result = []
+        for tile in self._tiles.values():
+            entry = {"type": tile.source_type, "name": tile.source_name}
+            ov = tile.overrides.to_dict()
+            if ov:
+                entry["overrides"] = ov
+            result.append(entry)
+        return result
+
+    @pyqtSlot(str)
+    def _on_overrides_changed(self, source_name: str):
+        self._profiles.save_profile(
+            self._profiles.active_name, self._settings, self._current_sources()
+        )
 
     def _restore_sources(self, sources: list) -> None:
         """
@@ -347,7 +357,8 @@ class MainWindow(QMainWindow):
                     None,
                 )
             if src:
-                self._add_tile(src)
+                ov = SourceOverrides.from_dict(entry.get("overrides", {}))
+                self._add_tile(src, overrides=ov)
             else:
                 not_found.append(src_name)
 
@@ -475,7 +486,7 @@ class MainWindow(QMainWindow):
 # ---------------------------------------------------------------------------
 
 from PyQt6.QtCore import QPoint, QRect, QSize
-from PyQt6.QtWidgets import QLayout, QLayoutItem, QSizePolicy
+from PyQt6.QtWidgets import QLayout, QLayoutItem
 
 
 class _FlowLayout(QLayout):
