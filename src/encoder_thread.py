@@ -47,14 +47,16 @@ class EncoderThread(threading.Thread):
     def __init__(self, *, open_container, close_container,
                  build_video, build_audio, use_nvenc,
                  on_status, on_error, on_stopped,
-                 log_tag="ENC", maxsize=60):
+                 log_tag="ENC", maxsize=120):
         super().__init__(daemon=True, name=f"{log_tag}-encoder")
         # Queue depth = how long a system-wide hiccup (AV scan, disk flush, OS
-        # task) the buffer can ride out before dropping.  ~60 frames ≈ 2 s at
-        # 30 fps.  Each slot holds one raw frame (~4 MB UYVY / ~6 MB BGR), so the
-        # memory ceiling is maxsize × frame_size × streams, reached only while
-        # actually backed up (normally the queue sits near empty).  Override with
-        # env MCR_ENC_QUEUE if you need to trade RAM for more/less absorption.
+        # task) the buffer can ride out before dropping.  Sized in frames, so the
+        # default 120 is ~2 s at 60 fps (and ~4 s at 30 fps) — i.e. the time
+        # cushion holds up even for high-frame-rate sources.  Each slot holds one
+        # raw frame (~4 MB UYVY / ~6 MB BGR), so the memory ceiling is
+        # maxsize × frame_size × streams, reached only while actually backed up
+        # (normally the queue sits near empty).  Override with env MCR_ENC_QUEUE
+        # to trade RAM for more/less absorption.
         _env_q = os.environ.get("MCR_ENC_QUEUE")
         if _env_q:
             try:
@@ -112,11 +114,18 @@ class EncoderThread(threading.Thread):
         """Finish the current recording and close the file."""
         return self._put_control(("stop",))
 
-    def submit_video(self, payload, frame_ts):
-        """Hand a raw video payload to the encoder.  Droppable when backed up."""
+    def submit_video(self, payload, frame_index):
+        """Hand a raw video payload to the encoder.  Droppable when backed up.
+
+        frame_index is the source frame's sequential position within the current
+        recording (assigned by the capture loop for *every* frame, including ones
+        that get dropped here).  Using it as the PTS means a dropped frame leaves
+        a gap in the timeline rather than compressing it, so video stays aligned
+        with audio and the file is true constant-frame-rate.
+        """
         self._submitted += 1
         try:
-            self._q.put_nowait(("video", payload, frame_ts))
+            self._q.put_nowait(("video", payload, frame_index))
         except queue.Full:
             self._dropped += 1
             self._dropped_total += 1
@@ -158,8 +167,7 @@ class EncoderThread(threading.Thread):
         w = h = 0
         fps = 30.0
 
-        v_rec_start  = None   # monotonic ts of first recorded video frame
-        v_pts_mult   = 0.0    # 1 / codec time_base (set once the codec opens)
+        v_idx0       = None   # source frame index of this recording's 1st frame
         v_last_pts   = -1     # last PTS used; enforces strict monotonicity
         a_pts        = 0      # running audio sample counter
         v_dts_offset = -1     # shift so first video DTS = 0; -1 = not seen yet
@@ -168,10 +176,9 @@ class EncoderThread(threading.Thread):
         v_err_count  = 0
 
         def _reset_session():
-            nonlocal v_rec_start, v_pts_mult, v_last_pts, a_pts
+            nonlocal v_idx0, v_last_pts, a_pts
             nonlocal v_dts_offset, audio_pkt_buf, session_failed, v_err_count
-            v_rec_start  = None
-            v_pts_mult   = 0.0
+            v_idx0       = None
             v_last_pts   = -1
             a_pts        = 0
             v_dts_offset = -1
@@ -238,27 +245,16 @@ class EncoderThread(threading.Thread):
                     continue
 
                 if kind == "video":
-                    _, payload, frame_ts = item
+                    _, payload, frame_index = item
                     if session_failed:
                         continue
+                    if v_idx0 is None:
+                        v_idx0 = frame_index   # anchor this recording's PTS at 0
 
                     if container is None:
-                        if v_rec_start is None:
-                            v_rec_start = frame_ts
                         try:
                             container, v_stream, a_stream = self._open_container(
                                 path, w, h, fps)
-                            # For NVENC the codec is pre-opened inside
-                            # open_container, so codec_context.time_base is valid
-                            # now — read the PTS scale before the first encode so
-                            # frame 1 gets a unique PTS.
-                            if v_pts_mult == 0.0:
-                                try:
-                                    ctb = v_stream.codec_context.time_base
-                                    if ctb and float(ctb) > 0.0:
-                                        v_pts_mult = 1.0 / float(ctb)
-                                except Exception:
-                                    pass
                             self._on_status("Recording")
                         except Exception as exc:
                             self._on_error(f"Could not open output file: {exc}")
@@ -272,16 +268,15 @@ class EncoderThread(threading.Thread):
                         vf = self._build_video(payload)
                         if vf is None:
                             continue
-                        # Wall-clock PTS in codec time_base units, clamped
-                        # strictly increasing so jitter or two frames in one tick
-                        # never collide.
-                        if v_pts_mult > 0.0:
-                            new_pts = max(0, round(
-                                (frame_ts - v_rec_start) * v_pts_mult))
-                            if new_pts <= v_last_pts:
-                                new_pts = v_last_pts + 1
-                        else:
-                            new_pts = 0   # first frame — anchor point
+                        # PTS = source frame index (anchored to 0) in the stream's
+                        # true rational time base → constant-frame-rate output at
+                        # the real source rate.  A dropped frame leaves a gap
+                        # (the index skips), so the timeline and audio sync are
+                        # preserved instead of the video being compressed shorter.
+                        # Clamp strictly increasing as a safety net.
+                        new_pts = max(0, frame_index - v_idx0)
+                        if new_pts <= v_last_pts:
+                            new_pts = v_last_pts + 1
                         v_last_pts = new_pts
                         vf.pts = new_pts
 
@@ -323,17 +318,6 @@ class EncoderThread(threading.Thread):
                                     print(f"[{self._tag}] buffered audio mux "
                                           f"error: {_ae}", flush=True)
                             audio_pkt_buf.clear()
-
-                        # A software codec opens on its first encode(); read its
-                        # real time_base now so subsequent PTS use the right scale.
-                        if v_pts_mult == 0.0:
-                            try:
-                                ctb = v_stream.codec_context.time_base
-                                v_pts_mult = (1.0 / float(ctb)
-                                              if ctb and float(ctb) > 0.0
-                                              else float(round(fps)))
-                            except Exception:
-                                v_pts_mult = float(round(fps))
                         st_n += 1
                     except Exception as exc:
                         if v_err_count < 3:

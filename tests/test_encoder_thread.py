@@ -104,7 +104,7 @@ def test_normal_lifecycle():
     enc.begin("out.mp4", 1920, 1080, 29.97)
     t0 = time.monotonic()
     for i in range(10):
-        enc.submit_video(b"frame", t0 + i / 30.0)
+        enc.submit_video(b"frame", i)
         enc.submit_audio(b"audio")
     enc.end()
     enc.shutdown()
@@ -127,7 +127,7 @@ def test_build_error_keeps_thread_alive():
     enc.begin("out.mp4", 1920, 1080, 29.97)
     t0 = time.monotonic()
     for i in range(5):
-        enc.submit_video(b"frame", t0 + i / 30.0)
+        enc.submit_video(b"frame", i)
     time.sleep(0.2)
     assert enc.is_alive(), "thread died on a per-frame build error"
     enc.end()
@@ -144,7 +144,7 @@ def test_video_drop_does_not_block():
     t0 = time.monotonic()
     start = time.monotonic()
     for i in range(200):
-        enc.submit_video(b"frame", t0 + i / 30.0)   # must never block
+        enc.submit_video(b"frame", i)               # must never block
     elapsed = time.monotonic() - start
     assert elapsed < 2.0, f"submit_video appears to block ({elapsed:.2f}s)"
     enc.end()
@@ -159,7 +159,7 @@ def test_audio_does_not_hang_forever():
     enc.begin("out.mp4", 1920, 1080, 29.97)
     t0 = time.monotonic()
     for i in range(5):
-        enc.submit_video(b"frame", t0 + i / 30.0)
+        enc.submit_video(b"frame", i)
     start = time.monotonic()
     for i in range(5):
         enc.submit_audio(b"audio")
@@ -169,9 +169,73 @@ def test_audio_does_not_hang_forever():
     enc.join(timeout=10)
 
 
+def test_true_cfr_output():
+    """End-to-end: index PTS + true rational rate must yield a CFR file at the
+    exact source rate.  Skipped where PyAV/FFmpeg isn't installed."""
+    try:
+        import av
+        import numpy as np
+    except Exception:
+        print("test_true_cfr_output SKIPPED (PyAV not available)")
+        return
+
+    import tempfile
+    rate = Fraction(30000, 1001)        # true 29.97
+    path = os.path.join(tempfile.gettempdir(), "_enc_cfr_test.mp4")
+
+    def open_container(p, w, h, fps):
+        c = av.open(path, mode="w")
+        vs = c.add_stream("libx264", rate=rate)
+        vs.width, vs.height, vs.pix_fmt = w, h, "yuv420p"
+        # Match the real workers: no B-frames, so DTS == PTS and the index-based
+        # PTS stays monotonic without reordering.
+        vs.codec_context.max_b_frames = 0
+        vs.options = {"tune": "zerolatency", "preset": "ultrafast"}
+        tb = Fraction(rate.denominator, rate.numerator)
+        vs.time_base = tb
+        try:
+            vs.codec_context.time_base = tb
+        except Exception:
+            pass
+        return c, vs, None      # no audio stream in this test
+
+    def close_container(c, vs, a):
+        for pkt in vs.encode():
+            c.mux(pkt)
+        c.close()
+        return None, None, None
+
+    def build_video(payload):
+        img = np.full((180, 320, 3), 16, dtype=np.uint8)
+        return av.VideoFrame.from_ndarray(img, format="rgb24").reformat(format="yuv420p")
+
+    events = []
+    enc = EncoderThread(
+        open_container=open_container, close_container=close_container,
+        build_video=build_video, build_audio=lambda p: None,
+        use_nvenc=False, on_status=lambda s: None, on_error=lambda m: events.append(m),
+        on_stopped=lambda: None, log_tag="CFR",
+    )
+    enc.start()
+    enc.begin(path, 320, 180, rate)
+    for i in range(90):
+        enc.submit_video(b"x", i)
+    enc.end()
+    enc.shutdown()
+    enc.join(timeout=10)
+
+    d = av.open(path)
+    avg = d.streams.video[0].average_rate
+    d.close()
+    os.remove(path)
+    assert not events, f"encoder errors: {events}"
+    assert avg == rate, f"expected CFR {rate}, got {avg}"
+
+
 if __name__ == "__main__":
     test_normal_lifecycle()
     test_build_error_keeps_thread_alive()
     test_video_drop_does_not_block()
     test_audio_does_not_hang_forever()
+    test_true_cfr_output()
     print("ALL ENCODER THREAD TESTS PASSED")

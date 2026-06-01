@@ -583,6 +583,7 @@ class DeckLinkWorker(QThread):
         first_frame  = True
         output_path  = ''
         enc_started  = False   # has begin() been sent for the current session?
+        vseq         = 0       # source frame index within the current recording
 
         while self._running:
             # flags from GUI thread
@@ -635,14 +636,17 @@ class DeckLinkWorker(QThread):
                 if rec_active:
                     if not enc_started:
                         # cur_fps is the detected source rate (see _MODE_FPS); it
-                        # sets the container time base.  The encoder still derives
-                        # real PTS from wall-clock arrival time, so sub-frame rate
-                        # jitter doesn't drift.
+                        # sets the container's true rational time base.
                         enc_started = encoder.begin(output_path, w, h, cur_fps)
+                        if enc_started:
+                            vseq = 0   # first frame of this recording is index 0
                     if enc_started:
                         # uyvy was copied in the driver callback, so handing the
-                        # reference to the encoder thread is safe.
-                        encoder.submit_video((uyvy, w, h), frame_ts)
+                        # reference to the encoder thread is safe.  vseq is the
+                        # source frame index (incremented for every frame, so a
+                        # frame dropped at the queue leaves a PTS gap → CFR sync).
+                        encoder.submit_video((uyvy, w, h), vseq)
+                        vseq += 1
 
             elif kind == 'audio':
                 _, pcm, n_samp, audio_ts = item
@@ -820,11 +824,20 @@ class DeckLinkWorker(QThread):
         profile = self._settings.active_video_profile
         nvenc   = self._settings.use_nvenc
 
-        vs = c.add_stream(codec, rate=round(fps))
+        # Use the true rational frame rate (e.g. 30000/1001 for 29.97) for the
+        # stream rate and time base, so the recorded file is genuine
+        # constant-frame-rate at the real source rate rather than rounded to 30.
+        rate = fps if isinstance(fps, Fraction) else Fraction(fps).limit_denominator(1001000)
+        tb   = Fraction(rate.denominator, rate.numerator)   # 1 / rate
+        vs = c.add_stream(codec, rate=rate)
         vs.width     = w
         vs.height    = h
         vs.bit_rate  = self._settings.video_bitrate_bps
-        vs.time_base = Fraction(1, round(fps))
+        vs.time_base = tb
+        try:
+            vs.codec_context.time_base = tb
+        except Exception:
+            pass
 
         # NVENC accepts yuv420p directly.
         # Software HEVC main10 needs a 10-bit pixel format.

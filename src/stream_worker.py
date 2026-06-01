@@ -126,6 +126,7 @@ class StreamWorker(QThread):
         first_frame = True
         output_path = ""
         enc_started = False   # has begin() been sent for the current session?
+        vseq = 0              # source frame index within the current recording
 
         while self._running:
             # ---------- check flags from GUI thread ----------
@@ -190,9 +191,18 @@ class StreamWorker(QThread):
 
                         if rec_active:
                             if not enc_started:
-                                enc_started = encoder.begin(output_path, w, h, fps)
+                                # NDI frames carry the exact rational rate; pass it
+                                # so the file is true CFR at the real source rate.
+                                enc_started = encoder.begin(
+                                    output_path, w, h, Fraction(fps_n, fps_d))
+                                if enc_started:
+                                    vseq = 0
                             if enc_started:
-                                encoder.submit_video(bgr, frame_ts)
+                                # vseq = source frame index (incremented for every
+                                # frame); a frame dropped at the queue leaves a PTS
+                                # gap so the timeline and audio sync are preserved.
+                                encoder.submit_video(bgr, vseq)
+                                vseq += 1
                 except Exception:
                     pass
 
@@ -312,11 +322,20 @@ class StreamWorker(QThread):
         profile = self._settings.active_video_profile
         nvenc   = self._settings.use_nvenc
 
-        vs = c.add_stream(codec, rate=round(fps))
+        # Use the true rational frame rate (e.g. 30000/1001 for 29.97) for the
+        # stream rate and time base, so the recorded file is genuine
+        # constant-frame-rate at the real source rate rather than rounded to 30.
+        rate = fps if isinstance(fps, Fraction) else Fraction(fps).limit_denominator(1001000)
+        tb   = Fraction(rate.denominator, rate.numerator)   # 1 / rate
+        vs = c.add_stream(codec, rate=rate)
         vs.width     = w
         vs.height    = h
         vs.bit_rate  = self._settings.video_bitrate_bps
-        vs.time_base = Fraction(1, round(fps))
+        vs.time_base = tb
+        try:
+            vs.codec_context.time_base = tb
+        except Exception:
+            pass
 
         # NVENC accepts yuv420p directly.
         # Software HEVC main10 needs a 10-bit pixel format.
