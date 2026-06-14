@@ -2,8 +2,8 @@
 import os
 from datetime import datetime
 
-from PyQt6.QtCore import QSize, Qt, QTimer, pyqtSignal
-from PyQt6.QtGui import QImage, QPixmap
+from PyQt6.QtCore import QPointF, QRectF, QSize, Qt, QTimer, pyqtSignal
+from PyQt6.QtGui import QColor, QIcon, QImage, QPainter, QPixmap
 from PyQt6.QtWidgets import (
     QFrame, QHBoxLayout, QLabel, QPushButton, QSizePolicy, QVBoxLayout,
 )
@@ -12,6 +12,7 @@ from ..recording_settings import RecordingSettings
 from ..stream_worker import StreamWorker
 from ..decklink_manager import DeckLinkSource
 from ..decklink_worker import DeckLinkWorker
+from .settings_dialog import SettingsDialog
 
 _PREVIEW_W = 320
 _PREVIEW_H = 180
@@ -19,6 +20,43 @@ _NO_SIGNAL_STYLE = "color: #888888;"
 _RECORDING_STYLE = "color: #e74c3c; font-weight: bold;"
 _CONNECTED_STYLE = "color: #2ecc71;"
 _WAITING_STYLE = "color: #f39c12;"
+
+
+def _gear_icon(color: str = "#cfcfcf", size: int = 18) -> QIcon:
+    """Draw a settings/gear icon as a vector pixmap.
+
+    Drawn with QPainter rather than relying on an emoji/font glyph so it
+    always renders (no blank 'tofu' boxes) and stays crisp on any background.
+    """
+    pm = QPixmap(size, size)
+    pm.fill(Qt.GlobalColor.transparent)
+    p = QPainter(pm)
+    p.setRenderHint(QPainter.RenderHint.Antialiasing)
+    p.setPen(Qt.PenStyle.NoPen)
+    p.setBrush(QColor(color))
+
+    cx = cy = size / 2.0
+    r_teeth = size * 0.46     # how far teeth extend from centre
+    r_body = size * 0.30      # radius of the round cog body
+    tooth_w = size * 0.18
+    tooth_h = size * 0.20
+
+    p.translate(cx, cy)
+    for i in range(8):
+        p.save()
+        p.rotate(i * 45.0)
+        p.drawRoundedRect(
+            QRectF(-tooth_w / 2.0, -r_teeth, tooth_w, tooth_h), 1.5, 1.5
+        )
+        p.restore()
+    p.drawEllipse(QPointF(0, 0), r_body, r_body)
+
+    # Punch a transparent centre hole so the cog reads correctly on any bg.
+    p.setCompositionMode(QPainter.CompositionMode.CompositionMode_Clear)
+    p.setBrush(QColor(0, 0, 0))
+    p.drawEllipse(QPointF(0, 0), size * 0.13, size * 0.13)
+    p.end()
+    return QIcon(pm)
 
 
 class StreamTile(QFrame):
@@ -95,6 +133,14 @@ class StreamTile(QFrame):
         self._rec_btn.setObjectName("btn_record")
         self._rec_btn.clicked.connect(self._toggle_recording)
 
+        self._settings_btn = QPushButton()
+        self._settings_btn.setObjectName("btn_tile_settings")
+        self._settings_btn.setIcon(_gear_icon())
+        self._settings_btn.setIconSize(QSize(18, 18))
+        self._settings_btn.setToolTip("Settings for this stream")
+        self._settings_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._settings_btn.clicked.connect(self._open_stream_settings)
+
         self._remove_btn = QPushButton("✕ Remove")
         self._remove_btn.setObjectName("btn_remove")
         self._remove_btn.clicked.connect(
@@ -102,6 +148,7 @@ class StreamTile(QFrame):
         )
 
         btn_row.addWidget(self._rec_btn)
+        btn_row.addWidget(self._settings_btn)
         btn_row.addStretch()
         btn_row.addWidget(self._remove_btn)
         outer.addLayout(btn_row)
@@ -179,6 +226,14 @@ class StreamTile(QFrame):
             self.stop_recording()
         else:
             self.start_recording()
+
+    def _open_stream_settings(self):
+        """Open the settings dialog seeded with this stream's own settings,
+        applying any changes to just this tile."""
+        dlg = SettingsDialog(self._settings, parent=self)
+        dlg.setWindowTitle(f"Settings — {self._source}")
+        if dlg.exec():
+            self.apply_settings(dlg.get_settings())
 
     def _on_frame(self, img: QImage):
         scaled = img.scaled(

@@ -93,6 +93,19 @@ QPushButton#btn_remove:hover {
     color: #c0392b;
 }
 
+QPushButton#btn_tile_settings {
+    background-color: transparent;
+    border: none;
+    padding: 4px;
+    border-radius: 5px;
+}
+QPushButton#btn_tile_settings:hover {
+    background-color: #3a3a3a;
+}
+QPushButton#btn_tile_settings:pressed {
+    background-color: #2a2a2a;
+}
+
 /* ── Line edit / combo ── */
 QLineEdit {
     background-color: #2d2d2d;
@@ -231,10 +244,43 @@ QListWidget::item:hover {
 /* ── Radio / Check buttons ── */
 QRadioButton, QCheckBox {
     spacing: 8px;
+    color: #cfcfcf;
 }
+/* Highlight the selected option so it's unmistakable */
+QRadioButton:checked, QCheckBox:checked {
+    color: #6cb6ff;
+    font-weight: bold;
+}
+QRadioButton:disabled, QCheckBox:disabled {
+    color: #666;
+}
+
 QRadioButton::indicator, QCheckBox::indicator {
     width: 16px;
     height: 16px;
+    border: 2px solid #777;
+    background: #2d2d2d;
+}
+QRadioButton::indicator {
+    border-radius: 10px;
+}
+QCheckBox::indicator {
+    border-radius: 4px;
+}
+QRadioButton::indicator:hover, QCheckBox::indicator:hover {
+    border-color: #4a9eff;
+}
+/* Checked = solid blue fill with a light ring — clearly visible */
+QRadioButton::indicator:checked {
+    background: qradialgradient(cx:0.5, cy:0.5, radius:0.5,
+                fx:0.5, fy:0.5,
+                stop:0 #ffffff, stop:0.35 #ffffff,
+                stop:0.4 #2f6fb0, stop:1 #2f6fb0);
+    border: 2px solid #4a9eff;
+}
+QCheckBox::indicator:checked {
+    background: #2f6fb0;
+    border: 2px solid #4a9eff;
 }
 
 /* ── Tab widget ── */
@@ -254,7 +300,9 @@ QTabBar::tab {
 }
 QTabBar::tab:selected {
     background-color: #3a3a3a;
-    color: #e0e0e0;
+    color: #ffffff;
+    font-weight: bold;
+    border-bottom: 2px solid #4a9eff;
 }
 QTabBar::tab:hover:!selected {
     background-color: #323232;
