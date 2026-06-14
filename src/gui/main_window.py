@@ -41,6 +41,9 @@ class MainWindow(QMainWindow):
         self._build_ui()
         self._apply_initial_output_dir()
         self._start_status_refresh()
+        # Start the OSC listener now if it's enabled in the saved settings,
+        # so it works on launch without re-toggling the Enable OSC setting.
+        self._apply_osc_settings()
         # Re-open sources saved in the active profile (DeckLink sources are
         # already enumerated; NDI sources may not be visible yet so missing
         # ones are silently skipped at startup rather than shown as warnings).
