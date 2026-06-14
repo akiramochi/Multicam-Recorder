@@ -49,19 +49,6 @@ if _comtypes_ok:
                 (['out'], ctypes.POINTER(ctypes.POINTER(IDeckLink)), 'deckLinkInstance')),
         ]
 
-    # SDK 12.x–16.x IID (changed from SDK 9.x {DD04E5EC-…}).
-    class IDeckLinkInputCallback(IUnknown):
-        _iid_ = GUID('{C6FCE4C9-C4E4-4047-82FB-5D238232A902}')
-        _methods_ = [
-            COMMETHOD([], HRESULT, 'VideoInputFormatChanged',
-                (['in'], ctypes.c_uint32, 'notificationEvents'),
-                (['in'], ctypes.c_void_p, 'newDisplayMode'),
-                (['in'], ctypes.c_uint32, 'detectedSignalFlags')),
-            COMMETHOD([], HRESULT, 'VideoInputFrameArrived',
-                (['in'], ctypes.c_void_p, 'videoFrame'),
-                (['in'], ctypes.c_void_p, 'audioPacket')),
-        ]
-
     # IDeckLinkInput SDK 12.x-16.x: 16 methods (slots 3-18 after IUnknown's 3).
     # GetDisplayMode is NOT a member of IDeckLinkInput — it belongs to
     # IDeckLinkDisplayMode.  The previous definition included it erroneously,
@@ -138,10 +125,8 @@ def _bmd(s: str) -> int:
     return int.from_bytes(s.encode('ascii'), 'big')
 
 BMD_MODE_DETECT                        = _bmd('dtet')
-BMD_FORMAT_8BIT_BGRA                   = _bmd('BGRA')
 BMD_FORMAT_8BIT_YUV                    = _bmd('2vuy')
 BMD_AUDIO_SAMPLE_RATE_48K              = 48000
-BMD_AUDIO_SAMPLE_TYPE_16BIT_INT        = 16
 BMD_AUDIO_SAMPLE_TYPE_32BIT_INT        = 32
 BMD_VIDEO_INPUT_FLAG_DEFAULT           = 0
 BMD_VIDEO_INPUT_ENABLE_FORMAT_DETECT   = 1 << 0

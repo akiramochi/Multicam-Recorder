@@ -1,13 +1,14 @@
 """Per-stream worker thread: NDI receive → preview → encode."""
 import time
 from fractions import Fraction
-from typing import Optional, Tuple
+from typing import Tuple
 
 import numpy as np
 from PyQt6.QtCore import QMutex, QThread, pyqtSignal
 from PyQt6.QtGui import QImage
 
 from .recording_settings import RecordingSettings
+from .encoder_thread import EncoderThread
 
 try:
     import NDIlib as _ndi
@@ -50,6 +51,11 @@ class StreamWorker(QThread):
         self._start_flag = False
         self._stop_flag = False
         self._pending_path = ""
+        # Authoritative "is a recording session active" state, guarded by the
+        # mutex.  Set True/False by the capture loop on start/stop, and reset to
+        # False by the encoder thread (via _on_enc_stopped) when a session ends
+        # or aborts, so the next Record press is honoured.
+        self._rec_active = False
 
         self._preview_interval = 1.0 / self._PREVIEW_FPS
         self._last_preview_ts = 0.0
@@ -100,17 +106,27 @@ class StreamWorker(QThread):
         self._running = True
         self.status_changed.emit("Connected")
 
-        container = None
-        v_stream = None
-        a_stream = None
-        is_recording = False
-        v_pts = 0
-        a_pts = 0
-        v_dts_offset = -1   # shift so first video DTS = 0; -1 = not yet seen
-        audio_pkt_buf = []  # encoded audio pkts held until first video pkt muxed
+        # Encode + mux runs on its own thread so a keyframe or disk flush can
+        # never stall this capture loop and force dropped frames (the periodic
+        # stutter).  This loop only copies pixels/samples and feeds the encoder.
+        encoder = EncoderThread(
+            open_container=self._open_container,
+            close_container=self._close_container,
+            build_video=self._build_video,
+            build_audio=self._build_audio,
+            use_nvenc=self._settings.use_nvenc,
+            on_status=self.status_changed.emit,
+            on_error=self._on_enc_error,
+            on_stopped=self._on_enc_stopped,
+            log_tag=f"NDI:{self.source_name}",
+        )
+        encoder.start()
+
         no_signal_streak = 0
         first_frame = True
         output_path = ""
+        enc_started = False   # has begin() been sent for the current session?
+        vseq = 0              # source frame index within the current recording
 
         while self._running:
             # ---------- check flags from GUI thread ----------
@@ -120,25 +136,25 @@ class StreamWorker(QThread):
             pending = self._pending_path
             self._start_flag = False
             self._stop_flag = False
+            prev_active = self._rec_active
+            if start_req:
+                self._rec_active = True
+            if stop_req:
+                self._rec_active = False
+            rec_active = self._rec_active
             self._mutex.unlock()
 
-            if start_req and not is_recording:
+            if start_req and not prev_active:
                 output_path = pending
-                is_recording = True
+                enc_started = False
                 self.status_changed.emit("Waiting for frame…")
                 self.recording_started.emit(output_path)
 
-            if stop_req and is_recording:
-                container, v_stream, a_stream = self._close_container(
-                    container, v_stream, a_stream
-                )
-                is_recording = False
-                v_pts = 0
-                a_pts = 0
-                v_dts_offset = -1
-                audio_pkt_buf = []
-                self.status_changed.emit("Connected")
-                self.recording_stopped.emit()
+            if stop_req and prev_active:
+                # Hand the close off to the encoder thread; it drains any queued
+                # frames, writes the trailer, then emits recording_stopped.
+                encoder.end()
+                enc_started = False
 
             # ---------- receive frame ----------
             frame_type, v_frame, a_frame, _ = _ndi.recv_capture_v2(recv, 100)
@@ -146,6 +162,7 @@ class StreamWorker(QThread):
             # ---------- video ----------
             if frame_type == _ndi.FRAME_TYPE_VIDEO and v_frame:
                 no_signal_streak = 0
+                frame_ts = time.monotonic()   # arrival time → drives video PTS
                 w = v_frame.xres
                 h = v_frame.yres
                 fps_n = v_frame.frame_rate_N or 30000
@@ -160,77 +177,32 @@ class StreamWorker(QThread):
                     raw = np.frombuffer(v_frame.data, dtype=np.uint8)
                     expected = w * h * 4
                     if raw.size >= expected:
-                        bgrx = raw[:expected].reshape((h, w, 4))
+                        # Copy the pixels (dropping the unused alpha) before the
+                        # NDI frame is freed below; the encoder thread does the
+                        # colour conversion and encoding off this loop.
+                        bgr = np.ascontiguousarray(
+                            raw[:expected].reshape((h, w, 4))[:, :, :3])
 
                         # preview at limited rate
                         now = time.monotonic()
                         if now - self._last_preview_ts >= self._preview_interval:
                             self._last_preview_ts = now
-                            self._emit_preview(bgrx, w, h)
+                            self._emit_preview(bgr, w, h)
 
-                        # encoding
-                        if is_recording:
-                            if container is None:
-                                try:
-                                    container, v_stream, a_stream = self._open_container(
-                                        output_path, w, h, fps
-                                    )
-                                    v_pts = 0
-                                    a_pts = 0
-                                    self.status_changed.emit("Recording")
-                                except Exception as exc:
-                                    self.error_occurred.emit(
-                                        f"Could not open output file: {exc}"
-                                    )
-                                    is_recording = False
-                                    self.status_changed.emit("Connected")
-                                    self.recording_stopped.emit()
-
-                            if container is not None and v_stream is not None:
-                                try:
-                                    bgr = np.ascontiguousarray(bgrx[:, :, :3])
-                                    raw_frame = av.VideoFrame.from_ndarray(bgr, format="bgr24")
-                                    # NVENC does not accept bgr24; reformat to
-                                    # yuv420p first (libswscale, software).
-                                    if self._settings.use_nvenc:
-                                        av_frame = raw_frame.reformat(format="yuv420p")
-                                    else:
-                                        av_frame = raw_frame
-                                    is_first = (v_pts == 0)
-                                    av_frame.pts = v_pts
-                                    v_pts += 1
-                                    pkt_list = list(v_stream.encode(av_frame))
-                                    if is_first and self._settings.use_nvenc:
-                                        _dts_info = (
-                                            f' DTS={pkt_list[0].dts} PTS={pkt_list[0].pts}'
-                                            if pkt_list else ' (no packets — look-ahead still active?)'
-                                        )
-                                        print(f'[NDI] NVENC first encode:'
-                                              f' {len(pkt_list)} pkt(s){_dts_info}', flush=True)
-                                    for pkt in pkt_list:
-                                        if v_dts_offset < 0:
-                                            raw_dts = pkt.dts if pkt.dts is not None else 0
-                                            v_dts_offset = max(0, -raw_dts)
-                                            if v_dts_offset:
-                                                print(f'[NDI] DTS offset = {v_dts_offset}'
-                                                      f' (NVENC pipeline delay)', flush=True)
-                                        if v_dts_offset > 0:
-                                            if pkt.dts is not None:
-                                                pkt.dts += v_dts_offset
-                                            if pkt.pts is not None:
-                                                pkt.pts += v_dts_offset
-                                        container.mux(pkt)
-                                    # After first video mux triggers write_header with correct
-                                    # NVENC SPS/PPS extradata, flush any buffered audio packets.
-                                    if audio_pkt_buf and v_dts_offset >= 0:
-                                        for _ap in audio_pkt_buf:
-                                            try:
-                                                container.mux(_ap)
-                                            except Exception as _ae:
-                                                print(f'[NDI] buffered audio mux error: {_ae}', flush=True)
-                                        audio_pkt_buf.clear()
-                                except Exception as exc:
-                                    print(f'[NDI] video encode error: {exc}', flush=True)
+                        if rec_active:
+                            if not enc_started:
+                                # NDI frames carry the exact rational rate; pass it
+                                # so the file is true CFR at the real source rate.
+                                enc_started = encoder.begin(
+                                    output_path, w, h, Fraction(fps_n, fps_d))
+                                if enc_started:
+                                    vseq = 0
+                            if enc_started:
+                                # vseq = source frame index (incremented for every
+                                # frame); a frame dropped at the queue leaves a PTS
+                                # gap so the timeline and audio sync are preserved.
+                                encoder.submit_video(bgr, vseq)
+                                vseq += 1
                 except Exception:
                     pass
 
@@ -238,7 +210,7 @@ class StreamWorker(QThread):
 
             # ---------- audio ----------
             elif frame_type == _ndi.FRAME_TYPE_AUDIO and a_frame:
-                if is_recording and container is not None and a_stream is not None:
+                if rec_active and enc_started:
                     try:
                         n_ch = a_frame.no_channels
                         n_samp = a_frame.no_samples
@@ -248,25 +220,16 @@ class StreamWorker(QThread):
                         raw = np.frombuffer(a_frame.data, dtype=np.float32)
                         out_ch = min(n_ch, 2)
                         layout = "stereo" if out_ch == 2 else "mono"
-                        af = av.AudioFrame(format="fltp", layout=layout, samples=n_samp)
-                        af.sample_rate = a_frame.sample_rate
-                        # AAC-LC has a 1024-sample encoder delay; shift PTS so
-                        # the first output packet has DTS = 0, not −1024.
-                        # Without this the muxer returns EINVAL (errno 22) for
-                        # the first audio packet and corrupts the interleave queue.
-                        _AAC_DELAY = 1024
-                        af.pts = a_pts + _AAC_DELAY
-                        a_pts += n_samp
-                        for i in range(out_ch):
-                            start = i * stride_f32
-                            af.planes[i].update(raw[start: start + n_samp].tobytes())
-                        for pkt in a_stream.encode(af):
-                            if v_dts_offset >= 0:
-                                container.mux(pkt)
-                            else:
-                                audio_pkt_buf.append(pkt)
+                        # Copy each channel's samples before the frame is freed;
+                        # the encoder thread builds and encodes the AudioFrame.
+                        planes = [
+                            raw[i * stride_f32: i * stride_f32 + n_samp].copy()
+                            for i in range(out_ch)
+                        ]
+                        encoder.submit_audio(
+                            (planes, n_samp, layout, a_frame.sample_rate))
                     except Exception as exc:
-                        print(f'[NDI] audio encode error: {exc}', flush=True)
+                        print(f'[NDI] audio capture error: {exc}', flush=True)
 
                 _ndi.recv_free_audio_v2(recv, a_frame)
 
@@ -277,10 +240,10 @@ class StreamWorker(QThread):
                     no_signal_streak = 0
 
         # ------------------------------------------------------------------
-        # Shutdown
+        # Shutdown — let the encoder finish any queued frames and close the file.
         # ------------------------------------------------------------------
-        if container is not None:
-            self._close_container(container, v_stream, a_stream)
+        encoder.shutdown()
+        encoder.join(timeout=10.0)
 
         _ndi.recv_destroy(recv)
 
@@ -302,28 +265,77 @@ class StreamWorker(QThread):
         _ndi.recv_connect(recv, self._source.raw)
         return recv
 
-    def _emit_preview(self, bgrx: np.ndarray, w: int, h: int):
+    def _emit_preview(self, bgr: np.ndarray, w: int, h: int):
         try:
-            rgb = np.ascontiguousarray(bgrx[:, :, [2, 1, 0]])
+            rgb = np.ascontiguousarray(bgr[:, :, ::-1])
             qi = QImage(rgb.data, w, h, w * 3, QImage.Format.Format_RGB888)
             self.frame_ready.emit(qi.copy())
         except Exception:
             pass
 
+    # ------------------------------------------------------------------
+    # Encoder-thread bridge
+    # ------------------------------------------------------------------
+
+    def _build_video(self, payload):
+        """Build an av.VideoFrame from a contiguous BGR array (encoder thread)."""
+        bgr = payload
+        frame = av.VideoFrame.from_ndarray(bgr, format="bgr24")
+        # NVENC does not accept bgr24; convert to yuv420p (libswscale) here, on
+        # the encoder thread, so the capture loop is never charged for it.
+        if self._settings.use_nvenc:
+            frame = frame.reformat(format="yuv420p")
+        return frame
+
+    def _build_audio(self, payload):
+        """Build an av.AudioFrame from copied planar float samples."""
+        planes, n_samp, layout, sample_rate = payload
+        af = av.AudioFrame(format="fltp", layout=layout, samples=n_samp)
+        af.sample_rate = sample_rate
+        for i, plane in enumerate(planes):
+            af.planes[i].update(plane.tobytes())
+        return af, n_samp
+
+    def _on_enc_error(self, msg: str):
+        print(f'[NDI] {msg}', flush=True)
+        self.error_occurred.emit(msg)
+
+    def _on_enc_stopped(self):
+        self._mutex.lock()
+        self._rec_active = False
+        self._mutex.unlock()
+        self.status_changed.emit("Connected")
+        self.recording_stopped.emit()
+
     def _open_container(
         self, path: str, w: int, h: int, fps: float
     ) -> Tuple:
-        c = av.open(path, mode="w", options={"movflags": "+faststart"})
+        # NOTE: do NOT use movflags=+faststart here.  faststart performs a
+        # second pass at container close that rewrites the ENTIRE file to move
+        # the moov atom to the front — for a long recording that means waiting
+        # while gigabytes are re-copied before stop() returns.  Local recordings
+        # play back fine with moov at the end; if web/progressive streaming is
+        # ever needed, run a faststart remux as a separate post-process step.
+        c = av.open(path, mode="w")
 
         codec   = self._settings.effective_video_codec
         profile = self._settings.active_video_profile
         nvenc   = self._settings.use_nvenc
 
-        vs = c.add_stream(codec, rate=round(fps))
+        # Use the true rational frame rate (e.g. 30000/1001 for 29.97) for the
+        # stream rate and time base, so the recorded file is genuine
+        # constant-frame-rate at the real source rate rather than rounded to 30.
+        rate = fps if isinstance(fps, Fraction) else Fraction(fps).limit_denominator(1001000)
+        tb   = Fraction(rate.denominator, rate.numerator)   # 1 / rate
+        vs = c.add_stream(codec, rate=rate)
         vs.width     = w
         vs.height    = h
         vs.bit_rate  = self._settings.video_bitrate_bps
-        vs.time_base = Fraction(1, round(fps))
+        vs.time_base = tb
+        try:
+            vs.codec_context.time_base = tb
+        except Exception:
+            pass
 
         # NVENC accepts yuv420p directly.
         # Software HEVC main10 needs a 10-bit pixel format.

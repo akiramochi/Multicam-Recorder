@@ -5,14 +5,13 @@ from datetime import datetime
 from PyQt6.QtCore import QPointF, QRectF, QSize, Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import QColor, QIcon, QImage, QPainter, QPixmap
 from PyQt6.QtWidgets import (
-    QFrame, QHBoxLayout, QLabel, QPushButton, QSizePolicy, QVBoxLayout,
+    QFrame, QHBoxLayout, QLabel, QPushButton, QVBoxLayout,
 )
 
-from ..recording_settings import RecordingSettings
+from ..recording_settings import RecordingSettings, SourceOverrides
 from ..stream_worker import StreamWorker
 from ..decklink_manager import DeckLinkSource
 from ..decklink_worker import DeckLinkWorker
-from .settings_dialog import SettingsDialog
 
 _PREVIEW_W = 320
 _PREVIEW_H = 180
@@ -65,20 +64,29 @@ class StreamTile(QFrame):
     per-stream record / stop controls.
     """
 
-    remove_requested = pyqtSignal(str)   # emits source name
+    remove_requested  = pyqtSignal(str)   # emits source name
+    overrides_changed = pyqtSignal(str)   # emits source name when overrides updated
 
-    def __init__(self, source, settings: RecordingSettings, parent=None):
+    def __init__(
+        self,
+        source,
+        settings: RecordingSettings,
+        overrides: SourceOverrides | None = None,
+        parent=None,
+    ):
         super().__init__(parent)
         self.setObjectName("stream_tile")
         self.setFixedWidth(_PREVIEW_W + 24)
 
         self._source = source
         self._settings = settings.copy()
+        self._overrides: SourceOverrides = overrides or SourceOverrides()
         self._is_recording = False
         self._rec_start_time: datetime | None = None
 
         self._build_ui()
         self._start_worker()
+        self._refresh_cfg_indicator()
 
         self._duration_timer = QTimer(self)
         self._duration_timer.timeout.connect(self._update_duration)
@@ -137,9 +145,9 @@ class StreamTile(QFrame):
         self._settings_btn.setObjectName("btn_tile_settings")
         self._settings_btn.setIcon(_gear_icon())
         self._settings_btn.setIconSize(QSize(18, 18))
-        self._settings_btn.setToolTip("Settings for this stream")
+        self._settings_btn.setToolTip("Per-source recording settings")
         self._settings_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self._settings_btn.clicked.connect(self._open_stream_settings)
+        self._settings_btn.clicked.connect(self._open_source_settings)
 
         self._remove_btn = QPushButton("✕ Remove")
         self._remove_btn.setObjectName("btn_remove")
@@ -157,10 +165,13 @@ class StreamTile(QFrame):
     # Worker
     # ------------------------------------------------------------------
 
+    def _effective_settings(self) -> RecordingSettings:
+        return self._overrides.apply_to(self._settings)
+
     def _start_worker(self):
         cls = DeckLinkWorker if isinstance(self._source, DeckLinkSource) else StreamWorker
         self._worker = cls(self._source)
-        self._worker.configure(self._settings)
+        self._worker.configure(self._effective_settings())
         self._worker.frame_ready.connect(self._on_frame)
         self._worker.recording_started.connect(self._on_rec_started)
         self._worker.recording_stopped.connect(self._on_rec_stopped)
@@ -186,9 +197,13 @@ class StreamTile(QFrame):
     def is_recording(self) -> bool:
         return self._is_recording
 
+    @property
+    def overrides(self) -> SourceOverrides:
+        return self._overrides
+
     def apply_settings(self, settings: RecordingSettings):
         self._settings = settings.copy()
-        self._worker.configure(settings)
+        self._worker.configure(self._effective_settings())
 
     def start_recording(self):
         if self._is_recording:
@@ -204,7 +219,8 @@ class StreamTile(QFrame):
             c if c.isalnum() or c in "-_" else "_"
             for c in str(self._source)
         )
-        filename = f"{ts}_{safe}.{self._settings.file_extension}"
+        effective = self._effective_settings()
+        filename = f"{ts}_{safe}.{effective.file_extension}"
         path = os.path.join(out_dir, filename)
         self._worker.start_recording(path)
 
@@ -215,25 +231,44 @@ class StreamTile(QFrame):
     def shutdown(self):
         self._duration_timer.stop()
         self._worker.stop()
-        self._worker.wait(5000)
+        # The worker's run() finalises the file and joins its encoder thread
+        # (bounded to ~10 s) before returning, so this wait is guaranteed to end.
+        # It must outlast that join: deleting a QThread that is still running
+        # aborts the process, so wait long enough that run() has actually exited.
+        if not self._worker.wait(15000):
+            print(f"[StreamTile] worker for {self.source_name} did not stop "
+                  f"within 15s; leaving it to finish in the background",
+                  flush=True)
 
     # ------------------------------------------------------------------
     # Slots
     # ------------------------------------------------------------------
+
+    def _refresh_cfg_indicator(self):
+        if self._overrides.has_any():
+            self._settings_btn.setToolTip("Per-source settings (overrides active)")
+            self._settings_btn.setIcon(_gear_icon("#f39c12"))
+        else:
+            self._settings_btn.setToolTip("Per-source recording settings")
+            self._settings_btn.setIcon(_gear_icon())
+
+    def _open_source_settings(self):
+        from .source_settings_dialog import SourceSettingsDialog
+        dlg = SourceSettingsDialog(
+            str(self._source), self._settings, self._overrides, parent=self
+        )
+        if dlg.exec():
+            self._overrides = dlg.get_overrides()
+            self._worker.configure(self._effective_settings())
+            # Indicate overrides are active via tooltip on the gear button
+            self._refresh_cfg_indicator()
+            self.overrides_changed.emit(str(self._source))
 
     def _toggle_recording(self):
         if self._is_recording:
             self.stop_recording()
         else:
             self.start_recording()
-
-    def _open_stream_settings(self):
-        """Open the settings dialog seeded with this stream's own settings,
-        applying any changes to just this tile."""
-        dlg = SettingsDialog(self._settings, parent=self)
-        dlg.setWindowTitle(f"Settings — {self._source}")
-        if dlg.exec():
-            self.apply_settings(dlg.get_settings())
 
     def _on_frame(self, img: QImage):
         scaled = img.scaled(
