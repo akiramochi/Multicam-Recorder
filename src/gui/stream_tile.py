@@ -83,6 +83,7 @@ class StreamTile(QFrame):
         self._overrides: SourceOverrides = overrides or SourceOverrides()
         self._is_recording = False
         self._rec_start_time: datetime | None = None
+        self._peer_source_names: list[str] = []
 
         self._build_ui()
         self._start_worker()
@@ -172,6 +173,7 @@ class StreamTile(QFrame):
         cls = DeckLinkWorker if isinstance(self._source, DeckLinkSource) else StreamWorker
         self._worker = cls(self._source)
         self._worker.configure(self._effective_settings())
+        self._worker.set_use_own_audio(self._overrides.audio_source_name is None)
         self._worker.frame_ready.connect(self._on_frame)
         self._worker.recording_started.connect(self._on_rec_started)
         self._worker.recording_stopped.connect(self._on_rec_stopped)
@@ -200,6 +202,23 @@ class StreamTile(QFrame):
     @property
     def overrides(self) -> SourceOverrides:
         return self._overrides
+
+    @property
+    def audio_source_name(self) -> str | None:
+        return self._overrides.audio_source_name
+
+    @property
+    def worker(self):
+        """Expose the underlying worker for cross-stream audio connections."""
+        return self._worker
+
+    def update_peer_sources(self, names: list[str]):
+        """MainWindow calls this when tiles are added/removed."""
+        self._peer_source_names = names
+
+    def submit_external_audio(self, payload):
+        """Receive audio routed from another source's audio_captured signal."""
+        self._worker.submit_external_audio(payload)
 
     def apply_settings(self, settings: RecordingSettings):
         self._settings = settings.copy()
@@ -255,11 +274,14 @@ class StreamTile(QFrame):
     def _open_source_settings(self):
         from .source_settings_dialog import SourceSettingsDialog
         dlg = SourceSettingsDialog(
-            str(self._source), self._settings, self._overrides, parent=self
+            str(self._source), self._settings, self._overrides,
+            available_audio_sources=self._peer_source_names,
+            parent=self,
         )
         if dlg.exec():
             self._overrides = dlg.get_overrides()
             self._worker.configure(self._effective_settings())
+            self._worker.set_use_own_audio(self._overrides.audio_source_name is None)
             # Indicate overrides are active via tooltip on the gear button
             self._refresh_cfg_indicator()
             self.overrides_changed.emit(str(self._source))
