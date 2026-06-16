@@ -125,6 +125,8 @@ class SourceOverrides:
     """Per-source overrides that supersede the global RecordingSettings.
 
     Any field left as None means "use the global value".
+    audio_source_name is None means "use own audio" (not an encoding param,
+    so it is not applied via apply_to — it controls cross-source routing).
     """
     video_codec:        Optional[VideoCodec]  = None
     container:          Optional[Container]   = None
@@ -133,6 +135,7 @@ class SourceOverrides:
     h264_profile:       Optional[H264Profile] = None
     h265_profile:       Optional[H265Profile] = None
     use_nvenc:          Optional[bool]        = None
+    audio_source_name:  Optional[str]         = None  # None = own audio
 
     def apply_to(self, base: RecordingSettings) -> RecordingSettings:
         """Return a copy of *base* with non-None overrides applied."""
@@ -151,6 +154,7 @@ class SourceOverrides:
             self.video_codec, self.container,
             self.video_bitrate_kbps, self.audio_bitrate_kbps,
             self.h264_profile, self.h265_profile, self.use_nvenc,
+            self.audio_source_name,
         ))
 
     def to_dict(self) -> dict:
@@ -162,6 +166,7 @@ class SourceOverrides:
         if self.h264_profile       is not None: d["h264_profile"]       = self.h264_profile.value
         if self.h265_profile       is not None: d["h265_profile"]       = self.h265_profile.value
         if self.use_nvenc          is not None: d["use_nvenc"]          = self.use_nvenc
+        if self.audio_source_name  is not None: d["audio_source_name"]  = self.audio_source_name
         return d
 
     @classmethod
@@ -175,6 +180,7 @@ class SourceOverrides:
             if "h264_profile"       in d: o.h264_profile       = H264Profile(d["h264_profile"])
             if "h265_profile"       in d: o.h265_profile       = H265Profile(d["h265_profile"])
             if "use_nvenc"          in d: o.use_nvenc          = bool(d["use_nvenc"])
+            if "audio_source_name"  in d: o.audio_source_name  = str(d["audio_source_name"])
         except Exception:
             pass
         return o

@@ -32,6 +32,9 @@ class MainWindow(QMainWindow):
         self._profiles = ProfileManager()
         self._settings = self._profiles.get_active_settings()
         self._tiles: Dict[str, StreamTile] = {}   # source_name → tile
+        # Tracks active cross-source audio connections as (src_tile, dst_tile)
+        # so they can be disconnected cleanly on re-route or tile removal.
+        self._audio_routing: List[tuple] = []
 
         self._osc = OSCManager(self)
         self._osc.start_all_requested.connect(self._start_all)
@@ -209,6 +212,8 @@ class MainWindow(QMainWindow):
         self._tiles[name] = tile
         self._grid_layout.addWidget(tile)
         self._empty_label.setVisible(False)
+        self._update_peer_sources()
+        self._update_audio_routing()
         self._update_status()
 
     @pyqtSlot(str)
@@ -216,12 +221,15 @@ class MainWindow(QMainWindow):
         tile = self._tiles.pop(source_name, None)
         if tile is None:
             return
+        # Disconnect audio routing before shutting down to avoid stale callbacks.
+        self._update_audio_routing()
         tile.shutdown()
         self._grid_layout.removeWidget(tile)
         tile.setParent(None)
         tile.deleteLater()
         if not self._tiles:
             self._empty_label.setVisible(True)
+        self._update_peer_sources()
         self._update_status()
 
     def _start_all(self):
@@ -333,9 +341,42 @@ class MainWindow(QMainWindow):
 
     @pyqtSlot(str)
     def _on_overrides_changed(self, source_name: str):
+        self._update_audio_routing()
         self._profiles.save_profile(
             self._profiles.active_name, self._settings, self._current_sources()
         )
+
+    def _update_peer_sources(self):
+        """Tell each tile the names of all other tiles (for the audio source picker)."""
+        all_names = list(self._tiles.keys())
+        for name, tile in self._tiles.items():
+            tile.update_peer_sources([n for n in all_names if n != name])
+
+    def _update_audio_routing(self):
+        """Disconnect all cross-source audio links then re-establish from overrides."""
+        for src_tile, dst_tile in self._audio_routing:
+            try:
+                src_tile.worker.audio_captured.disconnect(dst_tile.submit_external_audio)
+            except (TypeError, RuntimeError):
+                pass
+        self._audio_routing.clear()
+
+        for dst_tile in self._tiles.values():
+            src_name = dst_tile.audio_source_name
+            if src_name and src_name != dst_tile.source_name:
+                src_tile = self._tiles.get(src_name)
+                if src_tile:
+                    # DirectConnection: called on the source's capture thread
+                    # immediately — submit_external_audio is non-blocking so this
+                    # never stalls the source.
+                    src_tile.worker.audio_captured.connect(
+                        dst_tile.submit_external_audio,
+                        Qt.ConnectionType.DirectConnection,
+                    )
+                    self._audio_routing.append((src_tile, dst_tile))
+                    dst_tile.worker.set_use_own_audio(False)
+                    continue
+            dst_tile.worker.set_use_own_audio(True)
 
     def _restore_sources(self, sources: list) -> None:
         """

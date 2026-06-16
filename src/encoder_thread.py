@@ -134,6 +134,17 @@ class EncoderThread(threading.Thread):
                       f"{self._dropped_total} video frame(s) so far", flush=True)
                 self._dropped = 0
 
+    def submit_audio_nonblocking(self, payload):
+        """Like submit_audio but drops immediately if the queue is full.
+
+        Used for externally-routed audio: called from the source's capture
+        thread via DirectConnection, so it must never block that thread.
+        """
+        try:
+            self._q.put_nowait(("audio", payload))
+        except queue.Full:
+            pass
+
     def submit_audio(self, payload):
         """Hand a raw audio payload to the encoder.
 

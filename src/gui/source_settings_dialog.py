@@ -25,6 +25,7 @@ class SourceSettingsDialog(QDialog):
         source_name: str,
         global_settings: RecordingSettings,
         overrides: SourceOverrides,
+        available_audio_sources: list | None = None,
         parent=None,
     ):
         super().__init__(parent)
@@ -32,6 +33,7 @@ class SourceSettingsDialog(QDialog):
         self.setMinimumWidth(500)
         self._global = global_settings
         self._overrides = overrides.to_dict()   # working copy as plain dict
+        self._available_audio_sources = available_audio_sources or []
         self._result: SourceOverrides | None = None
         self._build_ui()
         self._load(global_settings, overrides)
@@ -128,6 +130,25 @@ class SourceSettingsDialog(QDialog):
             lambda on: self._set_enabled(on, self._abr_slider, self._abr_spin)
         )
         root.addWidget(self._make_section(self._abr_cb, abr_group))
+
+        # ── Audio Source ──────────────────────────────────────────────
+        audio_src_group = QGroupBox("Audio Source")
+        audio_src_group.setLayout(QVBoxLayout())
+        audio_src_group.layout().setContentsMargins(8, 4, 8, 4)
+
+        self._audio_src_combo = QComboBox()
+        self._audio_src_combo.addItem("Own Audio  (default)", userData=None)
+        for name in self._available_audio_sources:
+            self._audio_src_combo.addItem(name, userData=name)
+        self._audio_src_combo.setEnabled(bool(self._available_audio_sources))
+
+        audio_src_note = QLabel(
+            "Record audio from a different source alongside this video."
+        )
+        audio_src_note.setStyleSheet("color: #888; font-size: 11px;")
+        audio_src_group.layout().addWidget(self._audio_src_combo)
+        audio_src_group.layout().addWidget(audio_src_note)
+        root.addWidget(audio_src_group)
 
         root.addStretch()
 
@@ -255,6 +276,17 @@ class SourceSettingsDialog(QDialog):
         self._abr_spin.setValue(abr)
         self._set_enabled(has_abr, self._abr_slider, self._abr_spin)
 
+        # Audio source
+        if ov.audio_source_name is not None:
+            idx = self._audio_src_combo.findData(ov.audio_source_name)
+            if idx >= 0:
+                self._audio_src_combo.setCurrentIndex(idx)
+            else:
+                # Previously-saved source no longer available; reset to own audio
+                self._audio_src_combo.setCurrentIndex(0)
+        else:
+            self._audio_src_combo.setCurrentIndex(0)
+
     def _accept(self):
         o = SourceOverrides()
 
@@ -277,6 +309,8 @@ class SourceSettingsDialog(QDialog):
 
         if self._abr_cb.isChecked():
             o.audio_bitrate_kbps = self._abr_spin.value()
+
+        o.audio_source_name = self._audio_src_combo.currentData()
 
         self._result = o
         self.accept()

@@ -366,6 +366,9 @@ class DeckLinkWorker(QThread):
     status_changed    = pyqtSignal(str)
     error_occurred    = pyqtSignal(str)
     stream_info       = pyqtSignal(int, int, float)
+    # Emits every audio frame as (planes, n_samp, layout, sample_rate) so
+    # other streams can route this source's audio into their recording.
+    audio_captured    = pyqtSignal(object)
 
     _PREVIEW_FPS = 15
 
@@ -385,6 +388,8 @@ class DeckLinkWorker(QThread):
         self._preview_interval = 1.0 / self._PREVIEW_FPS
         self._last_preview_ts  = 0.0
         self._swscale_failed   = False   # one-time warn if the fast path fails
+        self._encoder          = None   # set while run() holds the EncoderThread
+        self._use_own_audio    = True   # False when audio is routed from another source
 
     # ------------------------------------------------------------------
     # Public API (GUI thread)
@@ -413,6 +418,20 @@ class DeckLinkWorker(QThread):
         self._running   = False
         self._stop_flag = True
         self._mutex.unlock()
+
+    def set_use_own_audio(self, val: bool):
+        """GUI thread: switch between own audio and externally-routed audio."""
+        self._use_own_audio = val
+
+    def submit_external_audio(self, payload):
+        """Receive audio routed from another source and feed it to this encoder.
+
+        Called via DirectConnection from the source's capture thread, so this
+        must not block.  Drops silently if our encoder is not recording yet.
+        """
+        enc = self._encoder
+        if enc:
+            enc.submit_audio_nonblocking(payload)
 
     def _err(self, msg: str):
         """Emit error to the UI tile and also print to terminal for diagnostics."""
@@ -579,6 +598,7 @@ class DeckLinkWorker(QThread):
             log_tag=f'DeckLink:{self._source.name}',
         )
         encoder.start()
+        self._encoder = encoder
 
         first_frame  = True
         output_path  = ''
@@ -650,10 +670,18 @@ class DeckLinkWorker(QThread):
 
             elif kind == 'audio':
                 _, pcm, n_samp, audio_ts = item
-                if rec_active and enc_started:
-                    # pcm was copied in the driver callback; the encoder thread
-                    # converts to float and builds the AudioFrame.
-                    encoder.submit_audio((pcm, n_samp))
+                try:
+                    # Normalize to float32 planar so other streams can consume
+                    # this audio without knowing the DeckLink-native int32 format.
+                    flt = pcm.astype(np.float32) / 2**31
+                    planes = [flt[0], flt[1]]
+                    payload = (planes, n_samp, 'stereo', BMD_AUDIO_SAMPLE_RATE_48K)
+                    # Always broadcast so listeners routing this audio can receive it.
+                    self.audio_captured.emit(payload)
+                    if self._use_own_audio and rec_active and enc_started:
+                        encoder.submit_audio(payload)
+                except Exception as exc:
+                    print(f'[DeckLink] audio capture error: {exc}', flush=True)
 
             elif kind == 'format_change':
                 # VideoInputFormatChanged fired — restart with the correct mode.
@@ -717,6 +745,7 @@ class DeckLinkWorker(QThread):
         # Let the encoder finish any queued frames and close the file.
         encoder.shutdown()
         encoder.join(timeout=10.0)
+        self._encoder = None
 
     # ------------------------------------------------------------------
 
@@ -764,13 +793,12 @@ class DeckLinkWorker(QThread):
             return vf
 
     def _build_audio(self, payload):
-        """Build a stereo fltp av.AudioFrame from copied int32 PCM."""
-        pcm, n_samp = payload
-        flt = pcm.astype(np.float32) / 2**31
-        af = av.AudioFrame(format='fltp', layout='stereo', samples=n_samp)
-        af.sample_rate = BMD_AUDIO_SAMPLE_RATE_48K
-        af.planes[0].update(flt[0].tobytes())
-        af.planes[1].update(flt[1].tobytes())
+        """Build a fltp av.AudioFrame from float32 planar payload."""
+        planes, n_samp, layout, sample_rate = payload
+        af = av.AudioFrame(format='fltp', layout=layout, samples=n_samp)
+        af.sample_rate = sample_rate
+        for i, plane in enumerate(planes):
+            af.planes[i].update(plane.tobytes())
         return af, n_samp
 
     def _on_enc_error(self, msg: str):

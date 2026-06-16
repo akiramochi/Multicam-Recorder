@@ -37,6 +37,9 @@ class StreamWorker(QThread):
     status_changed = pyqtSignal(str)      # human-readable state string
     error_occurred = pyqtSignal(str)
     stream_info = pyqtSignal(int, int, float)  # width, height, fps
+    # Emits every audio frame as (planes, n_samp, layout, sample_rate) so
+    # other streams can route this source's audio into their recording.
+    audio_captured = pyqtSignal(object)
 
     _PREVIEW_FPS = 15
 
@@ -57,6 +60,9 @@ class StreamWorker(QThread):
         # or aborts, so the next Record press is honoured.
         self._rec_active = False
 
+        self._encoder = None        # set while run() holds the EncoderThread
+        self._use_own_audio = True  # False when audio is routed from another source
+
         self._preview_interval = 1.0 / self._PREVIEW_FPS
         self._last_preview_ts = 0.0
 
@@ -70,6 +76,20 @@ class StreamWorker(QThread):
 
     def configure(self, settings: RecordingSettings):
         self._settings = settings.copy()
+
+    def set_use_own_audio(self, val: bool):
+        """GUI thread: switch between own audio and externally-routed audio."""
+        self._use_own_audio = val
+
+    def submit_external_audio(self, payload):
+        """Receive audio routed from another source and feed it to this encoder.
+
+        Called via DirectConnection from the source's capture thread, so this
+        must not block.  Drops silently if our encoder is not recording yet.
+        """
+        enc = self._encoder
+        if enc:
+            enc.submit_audio_nonblocking(payload)
 
     def start_recording(self, output_path: str):
         self._mutex.lock()
@@ -121,6 +141,7 @@ class StreamWorker(QThread):
             log_tag=f"NDI:{self.source_name}",
         )
         encoder.start()
+        self._encoder = encoder
 
         no_signal_streak = 0
         first_frame = True
@@ -210,26 +231,28 @@ class StreamWorker(QThread):
 
             # ---------- audio ----------
             elif frame_type == _ndi.FRAME_TYPE_AUDIO and a_frame:
-                if rec_active and enc_started:
-                    try:
-                        n_ch = a_frame.no_channels
-                        n_samp = a_frame.no_samples
-                        # channel_stride_in_bytes may include padding; use it
-                        # to index each channel rather than assuming tight packing
-                        stride_f32 = a_frame.channel_stride_in_bytes // 4
-                        raw = np.frombuffer(a_frame.data, dtype=np.float32)
-                        out_ch = min(n_ch, 2)
-                        layout = "stereo" if out_ch == 2 else "mono"
-                        # Copy each channel's samples before the frame is freed;
-                        # the encoder thread builds and encodes the AudioFrame.
-                        planes = [
-                            raw[i * stride_f32: i * stride_f32 + n_samp].copy()
-                            for i in range(out_ch)
-                        ]
-                        encoder.submit_audio(
-                            (planes, n_samp, layout, a_frame.sample_rate))
-                    except Exception as exc:
-                        print(f'[NDI] audio capture error: {exc}', flush=True)
+                try:
+                    n_ch = a_frame.no_channels
+                    n_samp = a_frame.no_samples
+                    # channel_stride_in_bytes may include padding; use it
+                    # to index each channel rather than assuming tight packing
+                    stride_f32 = a_frame.channel_stride_in_bytes // 4
+                    raw = np.frombuffer(a_frame.data, dtype=np.float32)
+                    out_ch = min(n_ch, 2)
+                    layout = "stereo" if out_ch == 2 else "mono"
+                    # Copy each channel's samples before the frame is freed;
+                    # the encoder thread builds and encodes the AudioFrame.
+                    planes = [
+                        raw[i * stride_f32: i * stride_f32 + n_samp].copy()
+                        for i in range(out_ch)
+                    ]
+                    payload = (planes, n_samp, layout, a_frame.sample_rate)
+                    # Always broadcast so listeners routing this audio can receive it.
+                    self.audio_captured.emit(payload)
+                    if self._use_own_audio and rec_active and enc_started:
+                        encoder.submit_audio(payload)
+                except Exception as exc:
+                    print(f'[NDI] audio capture error: {exc}', flush=True)
 
                 _ndi.recv_free_audio_v2(recv, a_frame)
 
@@ -244,6 +267,7 @@ class StreamWorker(QThread):
         # ------------------------------------------------------------------
         encoder.shutdown()
         encoder.join(timeout=10.0)
+        self._encoder = None
 
         _ndi.recv_destroy(recv)
 
