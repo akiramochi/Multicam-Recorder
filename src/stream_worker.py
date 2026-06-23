@@ -352,6 +352,12 @@ class StreamWorker(QThread):
         rate = fps if isinstance(fps, Fraction) else Fraction(fps).limit_denominator(1001000)
         tb   = Fraction(rate.denominator, rate.numerator)   # 1 / rate
         vs = c.add_stream(codec, rate=rate)
+        if codec in ('libx265', 'hevc_nvenc'):
+            # FFmpeg's MP4/MOV muxer defaults HEVC to the 'hev1' codec tag
+            # (out-of-band parameter sets).  QuickTime/AVFoundation only
+            # recognises 'hvc1' (in-band parameter sets); without this the
+            # file plays in VLC/ffplay but QuickTime Player shows nothing.
+            vs.codec_context.codec_tag = 'hvc1'
         vs.width     = w
         vs.height    = h
         vs.bit_rate  = self._settings.video_bitrate_bps
