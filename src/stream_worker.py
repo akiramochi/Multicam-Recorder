@@ -385,8 +385,15 @@ class StreamWorker(QThread):
         elif codec == "libx264":
             opts = {"preset": "fast", "profile": profile, "tune": "zerolatency"}
         else:  # libx265
+            # bframes=0 keeps DTS == PTS (matches the nvenc/libx264 paths
+            # above) so encoder_thread's NVENC-pipeline-delay DTS-offset
+            # logic — which shifts every packet's PTS along with DTS — never
+            # fires here.  With B-frames on, libx265's frame reordering makes
+            # the first packet's DTS go negative for a different reason (true
+            # reordering, not pipeline delay), and shifting PTS to compensate
+            # desyncs video against audio, which isn't shifted the same way.
             opts = {"preset": "fast", "profile": profile,
-                    "x265-params": "log-level=none:keyint=60"}
+                    "x265-params": "log-level=none:keyint=60:bframes=0"}
         vs.options = opts
 
         if nvenc:
