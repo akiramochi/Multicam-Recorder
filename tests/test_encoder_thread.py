@@ -20,8 +20,8 @@ from src.encoder_thread import EncoderThread
 
 
 class FakePacket:
-    def __init__(self, pts, is_audio=False):
-        self.dts = pts
+    def __init__(self, pts, dts=None, is_audio=False):
+        self.dts = pts if dts is None else dts
         self.pts = pts
         self.size = 10
         self.is_keyframe = False
@@ -38,6 +38,25 @@ class FakeStream:
         if frame is None:
             return []                       # flush
         return [FakePacket(frame.pts, is_audio=self._audio)]
+
+
+class ScriptedStream:
+    """Video stream whose encode() yields one packet per call from a fixed
+    (dts, pts) script, ignoring the fed frame — used to replay real dts/pts
+    sequences captured from actual encoders (see scratch NVENC/libx265 repro
+    behind hevc-av-desync-bframes-options.md)."""
+    def __init__(self, dts_pts_pairs):
+        self.codec_context = type("C", (), {"time_base": Fraction(1, 30)})()
+        self.time_base = Fraction(1, 30)
+        self._script = list(dts_pts_pairs)
+        self._i = 0
+
+    def encode(self, frame=None):
+        if frame is None or self._i >= len(self._script):
+            return []
+        dts, pts = self._script[self._i]
+        self._i += 1
+        return [FakePacket(pts, dts=dts, is_audio=False)]
 
 
 class FakeContainer:
@@ -59,13 +78,15 @@ class FakeFrame:
         self.is_audio = is_audio
 
 
-def make_encoder(events, *, slow_mux=0.0, build_raises=False, maxsize=8):
+def make_encoder(events, *, slow_mux=0.0, build_raises=False, maxsize=8,
+                  video_stream=None):
     cont = {}
 
     def open_container(path, w, h, fps):
         c = FakeContainer()
         cont["c"] = c
-        return c, FakeStream(audio=False), FakeStream(audio=True)
+        vs = video_stream if video_stream is not None else FakeStream(audio=False)
+        return c, vs, FakeStream(audio=True)
 
     def close_container(c, vs, as_):
         if c is not None:
@@ -232,10 +253,96 @@ def test_true_cfr_output():
     assert avg == rate, f"expected CFR {rate}, got {avg}"
 
 
+def test_reordered_dts_pts_muxed_unmodified():
+    """libx265 with B-frames: dts/pts sequence captured from a real encode
+    (see hevc-av-desync-bframes-options.md). Both fields must be muxed
+    exactly as the encoder returned them — no manual offset. PTS is already
+    the correct real display time (`vf.pts = frame_index`); shifting it
+    desyncs audio. Shifting DTS alone (a naive fix) instead pushes DTS past
+    PTS on packet index 3 below, where the reorder margin is only 0 — an
+    invalid packet. Leaving both untouched avoids that and relies on the
+    muxer's own edit-list handling of a negative starting DTS (verified
+    separately to mux/read back cleanly with correct A/V sync)."""
+    script = [
+        (-2, 0), (-1, 5), (0, 3), (1, 1), (2, 2), (3, 4), (4, 10), (5, 8),
+        (6, 6), (7, 7),
+    ]
+    events = []
+    enc, cont = make_encoder(events, video_stream=ScriptedStream(script), maxsize=32)
+    enc.begin("out.mp4", 1920, 1080, 29.97)
+    for i in range(len(script)):
+        enc.submit_video(b"frame", i)
+    enc.end()
+    enc.shutdown()
+    enc.join(timeout=5)
+
+    c = cont["c"]
+    got = [(p.dts, p.pts) for p in c.video]
+    assert got == script, f"packets were modified: {got} != {script}"
+
+
+def test_locked_dts_pts_muxed_unmodified():
+    """No-reordering path (NVENC, or libx265 with bframes=0): dts==pts on
+    every packet, captured from a real bf=0 encode. Must also pass through
+    unmodified — this is the currently-working NVENC behaviour and must not
+    regress."""
+    script = [(-3 + i, -3 + i) for i in range(10)]   # dts==pts, first is -3
+    events = []
+    enc, cont = make_encoder(events, video_stream=ScriptedStream(script), maxsize=32)
+    enc.begin("out.mp4", 1920, 1080, 29.97)
+    for i in range(len(script)):
+        enc.submit_video(b"frame", i)
+    enc.end()
+    enc.shutdown()
+    enc.join(timeout=5)
+
+    c = cont["c"]
+    got = [(p.dts, p.pts) for p in c.video]
+    assert got == script, f"packets were modified: {got} != {script}"
+
+
+def test_audio_buffered_until_first_video_packet_muxed():
+    """Audio submitted before the encoder has emitted any video packet must
+    be held back, then flushed once the first video packet actually reaches
+    the container — not just once a video frame was submitted. Uses a
+    ScriptedStream whose first two encode() calls return no packet (encoder
+    buffering, as real B-frame lookahead does) to make sure the gate keys off
+    an actual muxed packet, not merely on submit_video having been called."""
+    script = [(None, None)] * 2 + [(0, 0), (1, 1), (2, 2)]
+
+    class DelayedStream(ScriptedStream):
+        def encode(self, frame=None):
+            if frame is None or self._i >= len(self._script):
+                return []
+            dts, pts = self._script[self._i]
+            self._i += 1
+            if dts is None:
+                return []
+            return [FakePacket(pts, dts=dts, is_audio=False)]
+
+    events = []
+    enc, cont = make_encoder(events, video_stream=DelayedStream(script), maxsize=32)
+    enc.begin("out.mp4", 1920, 1080, 29.97)
+    enc.submit_video(b"frame", 0)   # buffered internally, no packet yet
+    enc.submit_audio(b"audio")      # must be held, not muxed early
+    enc.submit_video(b"frame", 1)   # still buffered
+    enc.submit_video(b"frame", 2)   # first packet emitted here
+    enc.end()
+    enc.shutdown()
+    enc.join(timeout=5)
+
+    c = cont["c"]
+    assert len(c.audio) == 1, f"expected 1 audio packet muxed, got {len(c.audio)}"
+    assert len(c.video) >= 1, "expected at least one video packet muxed"
+
+
 if __name__ == "__main__":
     test_normal_lifecycle()
     test_build_error_keeps_thread_alive()
     test_video_drop_does_not_block()
     test_audio_does_not_hang_forever()
     test_true_cfr_output()
+    test_reordered_dts_pts_muxed_unmodified()
+    test_locked_dts_pts_muxed_unmodified()
+    test_audio_buffered_until_first_video_packet_muxed()
     print("ALL ENCODER THREAD TESTS PASSED")

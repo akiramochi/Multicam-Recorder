@@ -181,18 +181,18 @@ class EncoderThread(threading.Thread):
         v_idx0       = None   # source frame index of this recording's 1st frame
         v_last_pts   = -1     # last PTS used; enforces strict monotonicity
         a_pts        = 0      # running audio sample counter
-        v_dts_offset = -1     # shift so first video DTS = 0; -1 = not seen yet
+        video_muxed  = False  # has the first video packet been muxed yet?
         audio_pkt_buf = []    # encoded audio held until first video pkt muxed
         session_failed = False
         v_err_count  = 0
 
         def _reset_session():
             nonlocal v_idx0, v_last_pts, a_pts
-            nonlocal v_dts_offset, audio_pkt_buf, session_failed, v_err_count
+            nonlocal video_muxed, audio_pkt_buf, session_failed, v_err_count
             v_idx0       = None
             v_last_pts   = -1
             a_pts        = 0
-            v_dts_offset = -1
+            video_muxed  = False
             audio_pkt_buf = []
             session_failed = False
             v_err_count  = 0
@@ -299,29 +299,29 @@ class EncoderThread(threading.Thread):
                             _tc = time.perf_counter()
                             st_enc += _tc - _tb
                         for pkt in pkts:
-                            # NVENC's pipeline delay makes the first packet's DTS
-                            # negative; compute a one-time shift to bring it to 0
-                            # and apply it to every packet so DTS stays ≥ 0.
-                            if v_dts_offset < 0:
-                                raw_dts = pkt.dts if pkt.dts is not None else 0
-                                v_dts_offset = max(0, -raw_dts)
-                                if v_dts_offset:
-                                    print(f"[{self._tag}] DTS offset = "
-                                          f"{v_dts_offset} (NVENC pipeline "
-                                          f"delay)", flush=True)
-                            if v_dts_offset > 0:
-                                if pkt.dts is not None:
-                                    pkt.dts += v_dts_offset
-                                if pkt.pts is not None:
-                                    pkt.pts += v_dts_offset
+                            # DTS/PTS are muxed exactly as the encoder returns
+                            # them — no manual offset. A B-frame-reordered
+                            # stream's first DTS is genuinely negative (the
+                            # decoder must consume that packet before its
+                            # presentation time), and the fed-in PTS
+                            # (`vf.pts = frame_index`) is already the correct
+                            # real display time. Patching either would either
+                            # shift audio out of sync with video (shifting
+                            # PTS) or push DTS past PTS on later packets
+                            # (shifting DTS alone, since the reorder margin
+                            # varies per packet — verified against real
+                            # libx265 output). The MP4 muxer accepts a
+                            # negative starting DTS and normalizes it via an
+                            # edit list; see hevc-av-desync-bframes-options.md.
                             container.mux(pkt)
+                            video_muxed = True
                         if self._stats:
                             st_mux += time.perf_counter() - _tc
 
                         # The first video mux triggers write_header with the
                         # correct video codecpar/extradata; now flush any audio
                         # held back.
-                        if audio_pkt_buf and v_dts_offset >= 0:
+                        if audio_pkt_buf and video_muxed:
                             for _ap in audio_pkt_buf:
                                 try:
                                     container.mux(_ap)
@@ -352,7 +352,7 @@ class EncoderThread(threading.Thread):
                         af.pts = a_pts + self._AAC_DELAY
                         a_pts += n_samp
                         for pkt in a_stream.encode(af):
-                            if v_dts_offset >= 0:
+                            if video_muxed:
                                 container.mux(pkt)
                             else:
                                 audio_pkt_buf.append(pkt)
